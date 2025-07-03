@@ -73,19 +73,6 @@ Reads with primary + supplemental + softclip alignments are processed based on g
   Tags: FI:i:1, FI:i:2, TC:i:2
   ```
 
-### CIGAR Preservation
-
-#### Complex Primary Alignments
-- **Preserves**: Full CIGAR complexity including deletions (D), insertions (I), matches (M)
-- **Example**: `40S18M9D32M` → `40M1017N18M9D32M`
-- **Maintains**: Complete alignment information while adding recombination gaps
-
-#### Softclip Mapping Complexity
-- **Preserves**: Insertions and trailing softclips from softclip mappings
-- **Example**: Softclip CIGAR `35M7S` → Final: `48M798N35M7S`
-- **Purpose**: Retains unmapped portions that couldn't be aligned
-
-
 ## Output Format Specifications
 
 ### Single Merged Records
