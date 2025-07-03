@@ -1,13 +1,13 @@
 # Minimap2 Multi-Round Alignment with ViReMa Format Conversion
 
-This repository contains a pipeline for detecting viral recombination events using a multi-round alignment approach with Minimap2, followed by conversion to ViReMa-compatible format.
+ViReMa but with minimap2. Multi-round alignment approach with Minimap2, followed by conversion to ViReMa-compatible format. Everything downstream of SAM compilation is mostly the same.
 
 ## Overview
 
-1. Performs initial sensitive alignment with Minimap2
+1. Performs initial alignment with Minimap2
 2. Identifies and re-aligns softclipped regions to detect split alignments
 3. Converts alignment patterns to ViReMa-compatible format
-4. Preserves full CIGAR complexity while representing recombination events
+4. Preserves full CIGAR complexity (I and Ds) while representing recombination events
 
 ## Minimap2_Module
 
@@ -21,16 +21,18 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
 **New parameter:**
 - `-lr`: Long read technology (ont for Oxford Nanopore, pb for PacBio CLR, hifi for PacBio HiFi)
 
-## Pipeline Workflow
+## Logic
 
 ### 1. Initial Alignment
 - **Tool**: Minimap2 with technology-specific parameters:
-  - **Short reads (default)**: `-ax sr -k 20 -A 1 -B 2` (viral-optimized)
+  - **Short reads (default)**: `-ax sr -k 20 -A 1 -B 2`
   - **Oxford Nanopore**: `-ax map-ont`
   - **PacBio CLR**: `-ax map-pb` (not implemented yet)
   - **PacBio HiFi**: `-ax map-hifi` (not implemented yet)
 - **Purpose**: Broad alignment to identify primary mappings and softclipped regions
 - **Output**: Primary and supplemental alignments with softclipped portions
+
+Short reads that map often have supplemental alignments. ONT reads occassionally have supplemental alignments or multiple primary alignments in different orientations. Only the alignment with the highest alignment score has its softclips sent for additional rounds of alignment.
 
 ### 2. Softclip Extraction and Re-alignment
 - **Extraction**: Identifies softclipped sequences ≥ threshold length (Seed parameter) from primary alignments
@@ -42,7 +44,7 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
   - **Long reads**: Same technology-specific presets as initial alignment
 - **Purpose**: Detect split alignments indicating potential recombination events
 
-Sometimes, softclips will have softclips that exceed threshold length. These are sent for another round of mapping and have an additional softclip_0 or softclip_1 appended to the read name in the intermediate file. If these softclips map, they are stitched back to the primary alignment in the correct order.
+Sometimes, mapping softclips will have further softclips that exceed threshold length. These are sent for another round of mapping where the read name has an additional softclip_0 or softclip_1 appended to the read name in the intermediate file (output.sam). If these softclips map, they are stitched back to the primary alignment in the correct order. Softclips that remain unmapped but are internal (not at the ends of the final, stitched together mapping) are turned into I events in the CIGAR string.
 
 ### 3. Result Merging and Classification
 
