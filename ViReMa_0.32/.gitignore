@@ -1,0 +1,23 @@
+# Ignore all Test_Data files except FHV-related files
+Test_Data/*
+
+# Keep FHV-related files
+!Test_Data/FHV_*
+!Test_Data/FHV_*.txt
+!Test_Data/FHV_*.fasta
+!Test_Data/FHV_*.mmi
+!Test_Data/FHV_*.ebwt
+
+# Ignore FHV_nanopore specifically
+Test_Data/FHV_nanopore*
+
+# Ignore output files
+output*.sam
+TEMP_SAM
+Virus_*.txt
+multiRound
+__pycache__/
+*.pyc
+
+# Ignore BED files directory
+BED_Files/
