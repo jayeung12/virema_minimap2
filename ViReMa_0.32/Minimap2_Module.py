@@ -678,8 +678,11 @@ def group_contiguous_segments(segments):
     return contiguous_groups
 
 def create_single_merged_record_new(base_read_name, primary_read, segments):
-    """Create single merged record with N gaps for contiguous segments"""
+    """Create single merged record with N gaps for contiguous segments, using SAM-based accounting"""
     import re
+    
+    # Build hierarchical accounting map based on actual SAM file data
+    segment_accounting = build_hierarchical_accounting_map(base_read_name, segments)
     
     # Build merged CIGAR by processing segments in sequence order
     merged_cigar_parts = []
@@ -687,9 +690,16 @@ def create_single_merged_record_new(base_read_name, primary_read, segments):
     merged_ref_name = segments[0]['ref_name']
     
     for i, segment in enumerate(segments):
+        is_first_segment = (i == 0)
+        is_last_segment = (i == len(segments) - 1)
+        
+        # Get accounting info for this specific segment
+        segment_read_name = segment['read'][0]
+        accounted_positions = segment_accounting.get(segment_read_name, set())
+        
         if i == 0:
-            # First segment - add its aligned portion
-            aligned_ops = extract_aligned_operations(segment['cigar'])
+            # First segment
+            aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, is_first_segment, is_last_segment)
             merged_cigar_parts.extend(aligned_ops)
             last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
         else:
@@ -699,7 +709,7 @@ def create_single_merged_record_new(base_read_name, primary_read, segments):
                 merged_cigar_parts.append(f"{gap_size}N")
             
             # Add segment's aligned portion
-            aligned_ops = extract_aligned_operations(segment['cigar'])
+            aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, is_first_segment, is_last_segment)
             merged_cigar_parts.extend(aligned_ops)
             last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
     
@@ -720,23 +730,69 @@ def create_single_merged_record_new(base_read_name, primary_read, segments):
     
     return merged_read[:11] + essential_tags
 
-def extract_aligned_operations(cigar):
-    """Extract only the reference-aligned operations from CIGAR (M, D, N, =, X)"""
+def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_first_segment=False, is_last_segment=False):
+    """Extract reference-aligned operations from CIGAR, handling softclips based on global sequence position"""
     import re
     cigar_ops = re.findall(r'(\d+)([MIDNSHPX=])', cigar)
     aligned_ops = []
     
-    for length, op in cigar_ops:
+    # Find main alignment position to determine softclip positions
+    main_alignment_idx = None
+    for i, (length, op) in enumerate(cigar_ops):
+        if op in 'MI=X':
+            main_alignment_idx = i
+            break
+    
+    if accounted_softclip_positions is None:
+        accounted_softclip_positions = set()
+    
+    for i, (length, op) in enumerate(cigar_ops):
         if op in 'M=X':
             aligned_ops.append(f"{length}M")  # Normalize to M
         elif op in 'DN':
             aligned_ops.append(f"{length}{op}")
+        elif op == 'I':
+            # Always preserve insertion operations
+            aligned_ops.append(f"{length}I")
+        elif op == 'S':
+            # Determine softclip position type
+            if main_alignment_idx is not None:
+                if i < main_alignment_idx:
+                    position_type = (0,)  # Before main alignment
+                else:
+                    position_type = (1,)  # After main alignment
+                
+                # Only process softclips that are NOT accounted for by softclip alignments
+                if position_type not in accounted_softclip_positions:
+                    # Determine if this is a global edge or internal softclip
+                    is_global_edge = False
+                    
+                    if i == 0 and is_first_segment:
+                        # Beginning of first segment in global sequence
+                        is_global_edge = True
+                    elif i == len(cigar_ops) - 1 and is_last_segment:
+                        # End of last segment in global sequence
+                        is_global_edge = True
+                    
+                    if is_global_edge:
+                        # Global edge softclip - preserve as softclip
+                        aligned_ops.append(f"{length}S")
+                    else:
+                        # Internal softclip - convert to insertion
+                        aligned_ops.append(f"{length}I")
+                # If softclip is accounted for by a softclip alignment, skip it completely
     
     return aligned_ops
 
 def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
-    """Create paired records from multiple contiguous groups"""
+    """Create paired records from multiple contiguous groups using SAM-based accounting"""
     records = []
+    
+    # Build hierarchical accounting map based on actual SAM file data
+    all_segments = []
+    for group in contiguous_groups:
+        all_segments.extend(group)
+    segment_accounting = build_hierarchical_accounting_map(base_read_name, all_segments)
     
     for group_idx, group in enumerate(contiguous_groups):
         # Build CIGAR for this group
@@ -745,9 +801,17 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
         group_ref_name = group[0]['ref_name']
         
         for seg_idx, segment in enumerate(group):
+            # Determine global position: first segment overall and last segment overall
+            global_first = (group_idx == 0 and seg_idx == 0)
+            global_last = (group_idx == len(contiguous_groups) - 1 and seg_idx == len(group) - 1)
+            
+            # Get accounting info for this specific segment
+            segment_read_name = segment['read'][0]
+            accounted_positions = segment_accounting.get(segment_read_name, set())
+            
             if seg_idx == 0:
                 # First segment in group
-                aligned_ops = extract_aligned_operations(segment['cigar'])
+                aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, global_first, global_last)
                 group_cigar_parts.extend(aligned_ops)
                 last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
             else:
@@ -756,7 +820,8 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
                 if gap_size > 0:
                     group_cigar_parts.append(f"{gap_size}N")
                 
-                aligned_ops = extract_aligned_operations(segment['cigar'])
+                # Add segment's aligned portion
+                aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, global_first, global_last)
                 group_cigar_parts.extend(aligned_ops)
                 last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
         
@@ -807,6 +872,82 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
         records.append(record[:11] + tags)
     
     return records
+
+def get_mapped_softclip_positions(base_read_name, sam_file='output.sam'):
+    """Parse intermediate SAM file to determine which nested softclip positions are actually mapped"""
+    mapped_positions = set()
+    
+    with open(sam_file, 'r') as f:
+        for line in f:
+            if line.startswith('@'):
+                continue
+            
+            fields = line.strip().split('\t')
+            read_name = fields[0]
+            flag = int(fields[1])
+            
+            # Check if this is a nested softclip read for our base read
+            if read_name.startswith(base_read_name + '_softclip_'):
+                # Check if it's mapped (flag bit 4 not set)
+                if not (flag & 4):
+                    # Extract the softclip position from the read name
+                    # Parse nested softclip paths like: base_softclip_0_softclip_1
+                    softclip_part = read_name[len(base_read_name + '_'):]
+                    
+                    # Split and extract position indices
+                    parts = softclip_part.split('softclip_')
+                    if len(parts) >= 2:
+                        try:
+                            # Get the sequence of position indices
+                            position_indices = []
+                            for i in range(1, len(parts)):
+                                if parts[i]:
+                                    # Extract the index (handle additional suffixes)
+                                    index_str = parts[i].split('_')[0] if '_' in parts[i] else parts[i]
+                                    position_indices.append(int(index_str))
+                            
+                            if position_indices:
+                                # Convert to tuple for the position
+                                mapped_positions.add(tuple(position_indices))
+                        except ValueError:
+                            # Skip if we can't parse the position
+                            continue
+    
+    return mapped_positions
+
+def build_hierarchical_accounting_map(base_read_name, segments, sam_file='output.sam'):
+    """Build accounting map that considers the hierarchical softclip structure"""
+    # Get all mapped softclip positions from SAM file
+    mapped_positions = get_mapped_softclip_positions(base_read_name, sam_file)
+    
+    # Build accounting map for each segment based on its type and path
+    segment_accounting = {}
+    
+    for segment in segments:
+        segment_read_name = segment['read'][0]  # Get the read name from the segment
+        segment_accounting[segment_read_name] = set()
+        
+        if segment['type'] == 'main':
+            # For main alignment, check direct softclip positions
+            for mapped_pos in mapped_positions:
+                if len(mapped_pos) == 1:  # Direct softclip from main (e.g., (0,) or (1,))
+                    segment_accounting[segment_read_name].add(mapped_pos)
+        
+        elif segment['type'] == 'softclip':
+            # For softclip segments, check nested softclip positions
+            # Extract the current path from the segment read name
+            if '_softclip_' in segment_read_name:
+                current_path = parse_softclip_path_to_position(segment_read_name, base_read_name)
+                if current_path:
+                    # Check for mapped nested softclips from this path
+                    for mapped_pos in mapped_positions:
+                        # Check if this mapped position is a nested softclip from current path
+                        if len(mapped_pos) > len(current_path) and mapped_pos[:len(current_path)] == current_path:
+                            # This is a nested softclip, so the corresponding position in current segment is accounted for
+                            nested_pos = (mapped_pos[len(current_path)],)
+                            segment_accounting[segment_read_name].add(nested_pos)
+    
+    return segment_accounting
 
 def merge_split_alignments(base_read_name, reads):
     """Merge multiple alignment records using softclip merging logic"""
