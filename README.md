@@ -2,6 +2,8 @@
 
 This repository contains a pipeline for detecting viral recombination events using a multi-round alignment approach with Minimap2, followed by conversion to ViReMa-compatible format.
 
+I still need to perform additional validation, figure out reverse strand handling, add an option to align with host references, and add PacBio functionality.
+
 ## Overview
 
 1. Performs initial sensitive alignment with Minimap2
@@ -21,11 +23,13 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
 **New parameter:**
 - `-lr`: Long read technology (ont for Oxford Nanopore, pb for PacBio CLR, hifi for PacBio HiFi)
 
+Note that the interpretation of the --Seed parameter is slightly different. In this case, Seed acts as a threshold for softclips where only softclips with lengths greater than Seed are sent for a round of alignment.
+
 ## Pipeline Workflow
 
 ### 1. Initial Alignment
 - **Tool**: Minimap2 with technology-specific parameters:
-  - **Short reads (default)**: `-ax sr -k 20 -A 1 -B 2` (viral-optimized)
+  - **Short reads (default)**: `-ax sr -k 20 -A 1 -B 2`
   - **Oxford Nanopore**: `-ax map-ont`
   - **PacBio CLR**: `-ax map-pb` (not implemented yet)
   - **PacBio HiFi**: `-ax map-hifi` (not implemented yet)
@@ -39,12 +43,14 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
   - `softclip_1`: Softclips occurring **after** the main alignment
 - **Re-alignment**: Uses technology-specific parameters:
   - **Short reads**: More sensitive parameters (`-k 10 -w 5 -m 10`) to map softclipped regions
-  - **Long reads**: Same technology-specific presets as initial alignment
+  - **Long reads**: Softclips tend to be around the range of a short read so this is currently the same as for short reads. Considering adjusting based on softclip length.
 - **Purpose**: Detect split alignments indicating potential recombination events
 
-Sometimes, softclips will have softclips that exceed threshold length. These are sent for another round of mapping and have an additional softclip_0 or softclip_1 appended to the read name in the intermediate file. If these softclips map, they are stitched back to the primary alignment in the correct order.
+Sometimes, softclips will have softclips that exceed threshold length. These are sent for another round of mapping and have an additional softclip_0 or softclip_1 appended to the read name in the intermediate file. If these softclips map, they are stitched back to the primary alignment in the correct order. With all of the datasets I have tested, I have never seen more than 1 initial alignment + 5 additional iterative alignments.
 
 ### 3. Result Merging and Classification
+
+Read SOFTCLIP_MERGING_LOGIC.md for more details on how merging occurs.
 
 #### Single Alignments
 - Reads with only primary alignment
@@ -87,6 +93,9 @@ read1  0     ref    100  255   59M31H          ref    50     0     ...  ...   FI
 read1  2048  ref    50   255   59H31M          *      0      0     ...  ...   FI:i:2 NM:i:0 TC:i:2
 ```
 
+### 4. Downstream Categorization
+The logic beyond the creation of the output.SAM file is largely the same. Notable changes include additions of command line arguments and slight changes to acceptor and donor index logic (see VIREMA_CHANGES.md for details).
+
 ## Intermediate Files
 
 - **`output.sam`**: Complete alignment results (initial + merged softclip alignments)
@@ -95,8 +104,11 @@ read1  2048  ref    50   255   59H31M          *      0      0     ...  ...   FI
 - **`Test_Data/TEMP_READS.txt`**: FASTA format extracted softclipped sequences
 
 ## System Requirements
+I use a conda environment to handle dependencies.
+
+```bash
+conda install -c bioconda minimap2 samtools
+```
 
 - **Python**: 3.x with standard libraries (`subprocess`, `re`, `argparse`, `collections`)
 - **Minimap2**: Must be available in system PATH
-- **Memory**: Proportional to input size (typically modest requirements)
-- **Storage**: ~3x input file size for intermediate files

@@ -1,0 +1,23 @@
+# Ignore all Test_Data files except FHV-related files
+ViReMa_0.32/Test_Data/*
+
+# Keep FHV-related files
+!ViReMa_0.32/Test_Data/FHV_*
+!ViReMa_0.32/Test_Data/FHV_*.txt
+!ViReMa_0.32/Test_Data/FHV_*.fasta
+!ViReMa_0.32/Test_Data/FHV_*.mmi
+!ViReMa_0.32/Test_Data/FHV_*.ebwt
+
+# Ignore FHV_nanopore specifically
+ViReMa_0.32/Test_Data/FHV_nanopore*
+
+# Ignore output files in ViReMa_0.32/
+ViReMa_0.32/output*.sam
+ViReMa_0.32/TEMP_SAM
+ViReMa_0.32/Virus_*.txt
+ViReMa_0.32/multiRound
+ViReMa_0.32/__pycache__/
+ViReMa_0.32/*.pyc
+
+# Ignore BED files directory
+ViReMa_0.32/BED_Files/
