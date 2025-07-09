@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the detailed logic for merging softclip alignments with their corresponding main alignments in the ViReMa Minimap2 module. The merging process must respect both sequence ordering (based on softclip paths) and genomic positioning rules to determine whether segments can be merged with N gaps or must be split into paired records.
+This document describes the detailed logic for merging softclip alignments with their corresponding main alignments in the ViReMa Minimap2 module. The merging process uses a numerical position-based system for sequence ordering and genomic positioning rules to determine whether segments can be merged with N gaps or must be split into paired records.
 
 ## Softclip Naming Convention
 
@@ -22,30 +22,49 @@ This document describes the detailed logic for merging softclip alignments with 
 
 ## Sequence Ordering Rules
 
-### 1. Path-Based Positioning
-Each softclip read gets a position tuple based on its path:
-- `read_softclip_0` → `(0,)`
-- `read_softclip_1` → `(1,)`
-- `read_softclip_0_softclip_1` → `(0, 1)`
-- `read_softclip_1_softclip_0` → `(1, 0)`
-- `read_softclip_0_softclip_1_softclip_0` → `(0, 1, 0)`
-- Main alignment → `(0.5,)` (conceptually between 0 and 1)
+### 1. Numerical Position-Based System
+Each softclip read gets a calculated numerical position based on its path:
+- Main alignment → `0.5` (reference point)
+- `read_softclip_0` → `0.4` (0.5 - 0.1)
+- `read_softclip_1` → `0.6` (0.5 + 0.1)
+- `read_softclip_0_softclip_1` → `0.45` (0.4 + 0.05)
+- `read_softclip_1_softclip_0` → `0.55` (0.6 - 0.05)
+- `read_softclip_0_softclip_1_softclip_0` → `0.425` (0.45 - 0.025)
 
-### 2. Sequence Order Determination
-Sort all segments by their path tuples to get the correct sequence order:
-1. All `(0,...)` paths (most nested first)
-2. Main alignment `(0.5,)`
-3. All `(1,...)` paths (most nested first)
+### 2. Position Calculation Algorithm
+```python
+def calculate_sequence_position(read_name, base_read_name):
+    # Start from main alignment position
+    position = 0.5
+    base_offset = 0.1
+    
+    for level, direction in enumerate(path_indices):
+        # Calculate offset for this level (smaller for deeper nesting)
+        level_offset = base_offset / (2 ** level)
+        
+        if direction == 0:  # softclip_0: move earlier
+            position -= level_offset
+        elif direction == 1:  # softclip_1: move later
+            position += level_offset
+    
+    return position
+```
+
+### 3. Sequence Order Determination
+Sort all segments by their numerical positions to get the correct sequence order:
+1. All segments with position < 0.5 (softclip_0 variants)
+2. Main alignment at position 0.5
+3. All segments with position > 0.5 (softclip_1 variants)
 
 ### Example Sequence Orders
 
 **Case 1: Simple nesting**
-- Segments: `softclip_0`, `softclip_0_softclip_1`, main, `softclip_1`
-- Sequence order: `softclip_0` → `softclip_0_softclip_1` → main → `softclip_1`
+- `softclip_0` (0.4) → `softclip_0_softclip_1` (0.45) → main (0.5) → `softclip_1` (0.6)
 
 **Case 2: Complex nesting**
-- Segments: `softclip_0`, `softclip_0_softclip_1`, `softclip_0_softclip_1_softclip_0`, main, `softclip_1_softclip_0`, `softclip_1`
-- Sequence order: `softclip_0` → `softclip_0_softclip_1` → `softclip_0_softclip_1_softclip_0` → main → `softclip_1_softclip_0` → `softclip_1`
+- `softclip_0` (0.4) → `softclip_0_softclip_1` (0.45) → `softclip_0_softclip_1_softclip_0` (0.425) → main (0.5) → `softclip_1_softclip_0` (0.55) → `softclip_1` (0.6)
+
+Note: The numerical system automatically handles proper nesting order through the decreasing offset calculation.
 
 ## Genomic Merging Rules
 
@@ -100,15 +119,15 @@ Segments must be split into paired records if:
 ### Example 3: Complex Nested Case (From Original Issue)
 
 **Input segments:**
-- `SRR5085928.4191_softclip_0`: position 1000, CIGAR `200M100S`, end = 1299
-- `SRR5085928.4191_softclip_0_softclip_1`: position 500, CIGAR `100M`, end = 599
-- Main alignment: position 1200, CIGAR `300S200M`, end = 1399
+- `SRR5085928.4191_softclip_0`: genomic position 1000, CIGAR `200M100S`, end = 1299, sequence position = 0.4
+- `SRR5085928.4191_softclip_0_softclip_1`: genomic position 500, CIGAR `100M`, end = 599, sequence position = 0.45
+- Main alignment: genomic position 1200, CIGAR `300S200M`, end = 1399, sequence position = 0.5
 
-**Sequence order:** softclip_0 → softclip_0_softclip_1 → main
+**Sequence order (by numerical position):** softclip_0 (0.4) → softclip_0_softclip_1 (0.45) → main (0.5)
 
 **Genomic analysis:**
-- softclip_0 (1299) vs softclip_0_softclip_1 (500): Out of order (1299 >= 500) ❌
-- softclip_0_softclip_1 (599) vs main (1200): 599 < 1200 ✓ Can merge
+- softclip_0 (genomic end 1299) vs softclip_0_softclip_1 (genomic start 500): Out of order (1299 >= 500) ❌
+- softclip_0_softclip_1 (genomic end 599) vs main (genomic start 1200): 599 < 1200 ✓ Can merge
 
 **First merge contiguous segments:**
 - Group 1: `softclip_0` (alone)
@@ -144,34 +163,36 @@ Segments must be split into paired records if:
 ## Implementation Algorithm
 
 ### Step 1: Parse and Position
-1. Parse each read name to extract softclip path
-2. Convert path to position tuple
-3. Assign sequence positions to all segments
+1. For each read in the read group:
+   - If it's a softclip read (`_softclip_` in name): calculate numerical sequence position
+   - If it's the main alignment: assign position 0.5
+   - Select best alignment by AS score if multiple alignments exist for same position
 
 ### Step 2: Sequence Ordering
-1. Sort all segments by position tuples
+1. Sort all segments by their numerical positions (float values)
 2. This gives the correct sequence order regardless of genomic positions
 
 ### Step 3: Genomic Merging
 1. For each adjacent pair in sequence order:
    - Calculate genomic spans (start to end positions)
-   - Check for same reference and no overlap
+   - Check for same reference and no overlap: `end_pos_segment1 < start_pos_segment2`
    - Group contiguous segments for N-gap merging
 
 ### Step 4: Output Generation
-1. If all segments can be merged: create single merged record
+1. If all segments can be merged: create single merged record with N gaps
 2. If segments must be split: create paired records with appropriate hard clips
 
 ### Step 5: AS Score Selection
 - When multiple alignments map to the same sequence position, select the one with the highest AS (alignment score)
-- This handles supplementary alignments for the same softclip
+- This handles supplementary alignments for the same softclip automatically during read collection
 
 ## Key Considerations
 
-1. **Sequence order takes precedence** for determining the logical flow of the read
-2. **Genomic merging rules determine** the technical feasibility of merging
-3. **N-gap merging happens first**, then paired record creation
-4. **Hard clips in paired records** represent the portions of the sequence present in other records
-5. **AS scores resolve conflicts** when multiple alignments exist for the same sequence position
+1. **Numerical sequence positions** determine the logical flow of the read through calculated float values
+2. **Genomic merging rules determine** the technical feasibility of merging (same reference + no overlap)
+3. **AS scores resolve conflicts** when multiple alignments exist for the same sequence position
+4. **Hierarchical accounting** ensures proper softclip handling in merged records through SAM-based analysis
+5. **N-gap merging happens first**, then paired record creation if needed
+6. **Hard clips in paired records** represent the portions of the sequence present in other records
 
-This logic ensures that both the biological sequence relationships and the technical genomic constraints are properly respected in the final output.
+This logic ensures that both the biological sequence relationships and the technical genomic constraints are properly respected in the final output, using a robust numerical positioning system that handles arbitrary nesting complexity.

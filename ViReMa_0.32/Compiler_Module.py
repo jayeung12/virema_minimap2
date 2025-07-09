@@ -213,6 +213,60 @@ def Indices(List):
             n+=1
     return [Ms, Xs]
 
+def safe_extract_position(line, base_index, expected_offset, is_donor=False):
+    """
+    Safely extract position information from line array, handling complex CIGAR strings.
+    Looks for the first field at or after base_index+expected_offset that contains position info.
+    """
+    start_search = base_index + expected_offset
+    max_search = min(len(line), start_search + 5)  # Search a few positions ahead
+    
+    for i in range(start_search, max_search):
+        if i < len(line) and "_" in line[i]:
+            # This looks like position information (contains underscore)
+            parts = line[i].split("_")
+            if is_donor:
+                # For donor sites, check if it's RevStrand format
+                if "RevStrand" in line[i]:
+                    # RevStrand format: try to get the third part
+                    if len(parts) >= 3:
+                        try:
+                            int(parts[2])
+                            return parts[2]
+                        except ValueError:
+                            pass
+                else:
+                    # Normal strand format: try to get the second part
+                    if len(parts) >= 2:
+                        try:
+                            int(parts[1])
+                            return parts[1]
+                        except ValueError:
+                            pass
+            else:
+                # For acceptor sites, usually the first part
+                if len(parts) >= 1:
+                    try:
+                        int(parts[0])
+                        return parts[0]
+                    except ValueError:
+                        continue
+        elif i < len(line) and line[i].isdigit():
+            # Direct numeric position
+            return line[i]
+    
+    # If no valid position found, return the original attempt
+    if start_search < len(line):
+        if is_donor:
+            parts = line[start_search].split("_")
+            if "RevStrand" in line[start_search] and len(parts) >= 3:
+                return parts[2]
+            elif len(parts) >= 2:
+                return parts[1]
+        return line[start_search].split("_")[0]
+    else:
+        return "0"
+
 ##      -------------------------------------------------------------------------------------------------------
 ##      ExtractRefData() will find the names of the genes used in the virus or host genome references.
 ##      Bowtie-inspect must be in $PATH.
@@ -566,16 +620,8 @@ def RecreateOldFormatfromSAM(lines):
                 else:
                     pass
                 CurrentNt = int(Seg[3])
-                # Consolidate consecutive insertions and other operations
-                insertions = []
                 while CIGAR:
                     if CIGAR[1] == 'M':
-                        # Add any accumulated insertions before this match
-                        if insertions:
-                            Code += [str(sum(len(ins) for ins in insertions)), 'U']
-                            line.append(''.join(insertions))
-                            insertions = []
-                        
                         LenMapped = int(CIGAR[0])
                         if cfg.ScrutSAM and LenMapped <= cfg.Seed and PrevRec == True and len(CIGAR) < 3: 
                             ## Last Mapped Segment was shorter than seed allowed in ViReMa 
@@ -596,12 +642,6 @@ def RecreateOldFormatfromSAM(lines):
                             CIGAR = CIGAR[2:]
                             PrevRec = False                            
                     elif CIGAR[1] == 'X' or CIGAR[1] == 'S':
-                        # Add any accumulated insertions before this operation
-                        if insertions:
-                            Code += [str(sum(len(ins) for ins in insertions)), 'U']
-                            line.append(''.join(insertions))
-                            insertions = []
-                        
                         Xs = Read[:int(CIGAR[0])]
                         Read = Read[int(CIGAR[0]):]
                         Code += (CIGAR[:1]) + ['X']
@@ -610,41 +650,23 @@ def RecreateOldFormatfromSAM(lines):
                         CIGAR = CIGAR[2:]
                         PrevRec = False
                     elif CIGAR[1] == 'I':
-                        # Accumulate insertions instead of processing immediately
                         Is = Read[:int(CIGAR[0])]
                         Read = Read[int(CIGAR[0]):]
-                        insertions.append(Is)
+                        Code += (CIGAR[:1]) + ['U']
                         CIGAR = CIGAR[2:]
+                        line.append(Is)
                         PrevRec = False
                     elif CIGAR[1] == 'N':
-                        # Add any accumulated insertions before this gap
-                        if insertions:
-                            Code += [str(sum(len(ins) for ins in insertions)), 'U']
-                            line.append(''.join(insertions))
-                            insertions = []
-                        
                         CurrentNt += int(CIGAR[0])
                         CIGAR = CIGAR[2:]
                         PrevRec = True
                     elif CIGAR[1] == 'D':
-                        # Add any accumulated insertions before this deletion
-                        if insertions:
-                            Code += [str(sum(len(ins) for ins in insertions)), 'U']
-                            line.append(''.join(insertions))
-                            insertions = []
-                        
                         CurrentNt += int(CIGAR[0])
                         CIGAR = CIGAR[2:]
                         PrevRec = False
                     else: #H
                         CIGAR = CIGAR[2:]
                         PrevRec = False
-                
-                # Add any remaining insertions at the end
-                if insertions:
-                    Code += [str(sum(len(ins) for ins in insertions)), 'U']
-                    line.append(''.join(insertions))
-                    
             elif FLAG == '16' or FLAG == '2064' or FLAG == '272':
                 # if Ref in cfg.RefsLib1:
                 #     ##Only make cutting site arrays for virus
@@ -666,16 +688,8 @@ def RecreateOldFormatfromSAM(lines):
                 else:
                     pass
                 CurrentNt = int(Seg[3])
-                # Consolidate consecutive insertions for reverse strand
-                insertions = []
                 while CIGAR:
                     if CIGAR[1] == 'M':
-                        # Add any accumulated insertions before this match
-                        if insertions:
-                            Code = [str(sum(len(ins) for ins in insertions)), 'U'] + Code
-                            line.insert(0, ''.join(reversed(insertions)))
-                            insertions = []
-                        
                         line.insert(0, str(CurrentNt + int(CIGAR[0]) - 1) + '_RevStrand_' + str(CurrentNt))
                         line.insert(0, Seg[2].split()[0] + '_RevStrand')
                         Read = Read[int(CIGAR[0]):]
@@ -683,12 +697,6 @@ def RecreateOldFormatfromSAM(lines):
                         CurrentNt += int(CIGAR[0])   
                         CIGAR = CIGAR[2:]
                     elif CIGAR[1] == 'X' or CIGAR[1] == 'S':
-                        # Add any accumulated insertions before this operation
-                        if insertions:
-                            Code = [str(sum(len(ins) for ins in insertions)), 'U'] + Code
-                            line.insert(0, ''.join(reversed(insertions)))
-                            insertions = []
-                        
                         Xs = Read[:int(CIGAR[0])]
                         Read = Read[int(CIGAR[0]):]
                         Code = (CIGAR[:1]) + ['X'] + Code
@@ -696,28 +704,16 @@ def RecreateOldFormatfromSAM(lines):
                         CurrentNt += int(CIGAR[0])
                         CIGAR = CIGAR[2:]
                     elif CIGAR[1] == 'I':
-                        # Accumulate insertions for reverse strand
                         Is = Read[:int(CIGAR[0])]
                         Read = Read[int(CIGAR[0]):]
-                        insertions.append(Is)
+                        Code = CIGAR[:1] + ['U'] + Code
                         CIGAR = CIGAR[2:]
+                        line.insert(0, Is)
                     elif CIGAR[1] == 'N' or CIGAR[1] == 'D':
-                        # Add any accumulated insertions before this gap/deletion
-                        if insertions:
-                            Code = [str(sum(len(ins) for ins in insertions)), 'U'] + Code
-                            line.insert(0, ''.join(reversed(insertions)))
-                            insertions = []
-                        
                         CurrentNt += int(CIGAR[0])
                         CIGAR = CIGAR[2:]
                     else: #H
                         CIGAR = CIGAR[2:]
-                
-                # Add any remaining insertions at the beginning for reverse strand
-                if insertions:
-                    Code = [str(sum(len(ins) for ins in insertions)), 'U'] + Code
-                    line.insert(0, ''.join(reversed(insertions)))
-                    
         Totalline += line
         TotalCode += Code
     TotalCode = ''.join(TotalCode)
@@ -1181,9 +1177,9 @@ def ResultsSort(File1):
                                 Donor = line[i]
                                 #Ref = Donor
                                 if "RevStrand" in line[i+1]:
-                                    DonorSite = line[i+1].split("_")[2]
+                                    DonorSite = safe_extract_position(line, i, 1, is_donor=True)
                                 else:
-                                    DonorSite = line[i+1].split("_")[1]
+                                    DonorSite = safe_extract_position(line, i, 1, is_donor=True)
                                 #MappingStartPos = line[i+1].split("_")[0]
                                 # if "RevStrand" in line[i+1]:
                                 #     MappedReadData = cfg.Genes[str(Ref)][int(DonorSite)-1:int(MappingStartPos)]
@@ -1194,9 +1190,9 @@ def ResultsSort(File1):
                                         #Recombination Event
                                         Acceptor = line[i+2]
                                         if "RevStrand" in line[i+3]:
-                                                AcceptorSite = line[i+3].split("_")[0]
+                                                AcceptorSite = safe_extract_position(line, i, 3)
                                         else:
-                                                AcceptorSite = line[i+3].split("_")[0]
+                                                AcceptorSite = safe_extract_position(line, i, 3)
                                         if Donor == Acceptor and "_RevStrand" in Donor and fabs(int(DonorSite) - int(AcceptorSite) - 1) <= cfg.MicroInDel_Length:
                                             if int(DonorSite) - int(AcceptorSite) - 1 < 0:
                                                     #MicroInsertion on negative strand
@@ -1237,10 +1233,10 @@ def ResultsSort(File1):
                                         Acceptor = line[i+3]
                                         Insertion = line[i+2]
                                         if "RevStrand" in line[i+4]:
-                                                AcceptorSite = line[i+4].split("_")[0]
+                                                AcceptorSite = safe_extract_position(line, i, 4)
                                                 #Acceptor += "_RevStrand"
                                         else:
-                                                AcceptorSite = line[i+4].split("_")[0]
+                                                AcceptorSite = safe_extract_position(line, i, 4)
                                         if Acceptor == Donor and "_RevStrand" in Donor and int(DonorSite) == (int(AcceptorSite) + 1):
                                             Insertion = Rev_Comp(Insertion)
                                             #Simple Insertion Event in negative strand
@@ -1259,7 +1255,7 @@ def ResultsSort(File1):
                                             else:
                                                 uCount += 1
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, uInsDicts, ReadName)
-                                        elif AcceptorSite.isdigit() and DonorSite.isdigit() and int(AcceptorSite) == (int(DonorSite) + len(Insertion) + 1) and Acceptor == Donor and "_RevStrand" not in Donor:
+                                        elif int(AcceptorSite) == (int(DonorSite) + len(Insertion) + 1) and Acceptor == Donor and "_RevStrand" not in Donor:
                                             #Direct Substitution
                                             if len(Insertion) <= cfg.Mismatches:
                                                 #Mismatch, not Substitution

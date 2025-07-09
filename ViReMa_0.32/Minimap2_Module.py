@@ -310,17 +310,24 @@ def run_iterative_ont_alignment():
     print(f"Iterative alignment completed after {round_num-1} rounds")
 
 
-def parse_softclip_path_to_position(read_name, base_read_name):
+def calculate_sequence_position(read_name, base_read_name):
     """
-    Parse softclip path into a position tuple for sequence ordering.
+    Calculate sequence position for a softclip read based on its path.
+    
+    The position represents where in the sequence this segment should appear:
+    - Main alignment is at position 0.5
+    - softclip_0 variants appear before their parent (subtract offset)
+    - softclip_1 variants appear after their parent (add offset)
+    - Each nesting level uses smaller offsets to maintain proper ordering
     
     Examples:
-    - read_softclip_0 -> (0,)
-    - read_softclip_1 -> (1,) 
-    - read_softclip_0_softclip_1 -> (0, 1)
-    - read_softclip_0_softclip_1_softclip_0 -> (0, 1, 0)
+    - main: 0.5
+    - main_softclip_0: 0.4 (before main)
+    - main_softclip_0_softclip_1: 0.45 (between softclip_0 and main)
+    - main_softclip_1: 0.6 (after main)
+    - main_softclip_1_softclip_0: 0.55 (between main and softclip_1)
     
-    Returns: tuple representing the path through the sequence
+    Returns: float representing sequence position, or None if not a softclip read
     """
     if '_softclip_' not in read_name:
         return None  # Not a softclip read
@@ -334,31 +341,53 @@ def parse_softclip_path_to_position(read_name, base_read_name):
         return None
     
     # Extract position indices from the path
-    position_tuple = []
+    path_indices = []
     for i in range(1, len(parts)):  # Skip the first empty part
         try:
             if parts[i]:  # Make sure the part is not empty
                 # Handle cases where there might be additional content after the index
                 index_part = parts[i].split('_')[0] if '_' in parts[i] else parts[i]
-                position_tuple.append(int(index_part))
+                path_indices.append(int(index_part))
         except ValueError:
             # If we can't parse an index, skip it
             continue
     
-    return tuple(position_tuple) if position_tuple else None
+    if not path_indices:
+        return None
+    
+    # Calculate position by walking the path
+    # Start from main alignment position
+    position = 0.5
+    
+    # Each step in the path adjusts position
+    # Use decreasing offsets for each level to maintain proper ordering
+    base_offset = 0.1
+    
+    for level, direction in enumerate(path_indices):
+        # Calculate offset for this level (smaller for deeper nesting)
+        level_offset = base_offset / (2 ** level)
+        
+        if direction == 0:
+            # softclip_0: move to earlier position (before parent)
+            position -= level_offset
+        elif direction == 1:
+            # softclip_1: move to later position (after parent)
+            position += level_offset
+    
+    return position
 
 def get_sequence_position_for_read(read_name, base_read_name, primary_cigar):
     """
     Determine the sequence position for a read based on softclip path or main alignment.
     
-    Returns: tuple that can be used for sorting reads in sequence order
+    Returns: float that can be used for sorting reads in sequence order
     """
     if '_softclip_' in read_name:
-        return parse_softclip_path_to_position(read_name, base_read_name)
+        return calculate_sequence_position(read_name, base_read_name)
     else:
-        # This is the main alignment - assign it position (0.5,) to place it between
-        # softclip_0 (0,) and softclip_1 (1,)
-        return (0.5,)
+        # This is the main alignment - assign it position 0.5 to place it between
+        # softclip_0 variants (< 0.5) and softclip_1 variants (> 0.5)
+        return 0.5
 
 def select_best_alignment_by_as(alignments):
     """Select the best alignment from a list based on AS (alignment score)"""
@@ -755,15 +784,15 @@ def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_firs
             # Always preserve insertion operations
             aligned_ops.append(f"{length}I")
         elif op == 'S':
-            # Determine softclip position type
+            # Determine softclip position type using scalar positions
             if main_alignment_idx is not None:
                 if i < main_alignment_idx:
-                    position_type = (0,)  # Before main alignment
+                    position_scalar = 0.4  # Before main alignment (softclip_0 position)
                 else:
-                    position_type = (1,)  # After main alignment
+                    position_scalar = 0.6  # After main alignment (softclip_1 position)
                 
                 # Only process softclips that are NOT accounted for by softclip alignments
-                if position_type not in accounted_softclip_positions:
+                if position_scalar not in accounted_softclip_positions:
                     # Determine if this is a global edge or internal softclip
                     is_global_edge = False
                     
@@ -793,6 +822,9 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
     for group in contiguous_groups:
         all_segments.extend(group)
     segment_accounting = build_hierarchical_accounting_map(base_read_name, all_segments)
+    
+    # Pre-process all groups to get their final CIGAR operations
+    processed_groups = []
     
     for group_idx, group in enumerate(contiguous_groups):
         # Build CIGAR for this group
@@ -825,39 +857,62 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
                 group_cigar_parts.extend(aligned_ops)
                 last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
         
-        # Calculate hard clip size (other groups' sequence lengths)
-        other_groups_length = 0
-        for other_idx, other_group in enumerate(contiguous_groups):
-            if other_idx != group_idx:
-                for other_seg in other_group:
-                    # Estimate sequence length from aligned operations
-                    other_groups_length += sum(int(l) for l, o in re.findall(r'(\d+)([MI=X])', other_seg['cigar']))
+        # Store processed group information
+        processed_groups.append({
+            'cigar_parts': group_cigar_parts,
+            'ref_pos': group_ref_pos,
+            'ref_name': group_ref_name
+        })
+    
+    # Now build records with correct hard clips calculated from processed operations
+    for group_idx, processed_group in enumerate(processed_groups):
+        # Calculate directional hard clip sizes from processed CIGAR operations
+        preceding_groups_length = 0
+        following_groups_length = 0
+        
+        # Calculate length of groups that come before this one (for beginning hard clip)
+        for idx in range(group_idx):
+            processed_cigar = ''.join(processed_groups[idx]['cigar_parts'])
+            # Calculate query-consuming operations from processed CIGAR
+            preceding_groups_length += sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', processed_cigar))
+        
+        # Calculate length of groups that come after this one (for end hard clip)
+        for idx in range(group_idx + 1, len(processed_groups)):
+            processed_cigar = ''.join(processed_groups[idx]['cigar_parts'])
+            # Calculate query-consuming operations from processed CIGAR
+            following_groups_length += sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', processed_cigar))
         
         # Create record for this group
         record = primary_read.copy()
         record[0] = base_read_name
         record[1] = '0' if group_idx == 0 else '2048'  # Primary vs supplementary
-        record[2] = group_ref_name
-        record[3] = str(group_ref_pos)
+        record[2] = processed_group['ref_name']
+        record[3] = str(processed_group['ref_pos'])
         record[4] = '255'
-        record[5] = ''.join(group_cigar_parts)
         
-        # Add hard clips if there are other groups
-        if other_groups_length > 0:
-            if group_idx == 0:
-                # First group: hard clip at end
-                record[5] += f"{other_groups_length}H"
-            else:
-                # Later groups: hard clip at beginning
-                record[5] = f"{other_groups_length}H" + record[5]
+        # Build CIGAR with directional hard clips
+        cigar_parts = []
+        
+        # Add beginning hard clip if there are preceding groups
+        if preceding_groups_length > 0:
+            cigar_parts.append(f"{preceding_groups_length}H")
+        
+        # Add the main CIGAR for this group
+        cigar_parts.extend(processed_group['cigar_parts'])
+        
+        # Add end hard clip if there are following groups
+        if following_groups_length > 0:
+            cigar_parts.append(f"{following_groups_length}H")
+        
+        record[5] = ''.join(cigar_parts)
         
         # Set mate information for paired records
-        if len(contiguous_groups) > 1:
+        if len(processed_groups) > 1:
             if group_idx == 0:
                 # Primary points to first supplementary
-                next_group = contiguous_groups[1]
-                record[6] = next_group[0]['ref_name']
-                record[7] = str(next_group[0]['ref_pos'])
+                next_group = processed_groups[1]
+                record[6] = next_group['ref_name']
+                record[7] = str(next_group['ref_pos'])
                 record[8] = '0'
             else:
                 record[6] = '*'
@@ -866,7 +921,7 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
         
         # Add tags
         fi_value = group_idx + 1
-        tc_value = len(contiguous_groups)
+        tc_value = len(processed_groups)
         tags = [f'FI:i:{fi_value}', 'NM:i:0', f'TC:i:{tc_value}']
         
         records.append(record[:11] + tags)
@@ -874,8 +929,8 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
     return records
 
 def get_mapped_softclip_positions(base_read_name, sam_file='output.sam'):
-    """Parse intermediate SAM file to determine which nested softclip positions are actually mapped"""
-    mapped_positions = set()
+    """Parse intermediate SAM file to determine which nested softclip read names are actually mapped"""
+    mapped_read_names = set()
     
     with open(sam_file, 'r') as f:
         for line in f:
@@ -890,37 +945,18 @@ def get_mapped_softclip_positions(base_read_name, sam_file='output.sam'):
             if read_name.startswith(base_read_name + '_softclip_'):
                 # Check if it's mapped (flag bit 4 not set)
                 if not (flag & 4):
-                    # Extract the softclip position from the read name
-                    # Parse nested softclip paths like: base_softclip_0_softclip_1
-                    softclip_part = read_name[len(base_read_name + '_'):]
-                    
-                    # Split and extract position indices
-                    parts = softclip_part.split('softclip_')
-                    if len(parts) >= 2:
-                        try:
-                            # Get the sequence of position indices
-                            position_indices = []
-                            for i in range(1, len(parts)):
-                                if parts[i]:
-                                    # Extract the index (handle additional suffixes)
-                                    index_str = parts[i].split('_')[0] if '_' in parts[i] else parts[i]
-                                    position_indices.append(int(index_str))
-                            
-                            if position_indices:
-                                # Convert to tuple for the position
-                                mapped_positions.add(tuple(position_indices))
-                        except ValueError:
-                            # Skip if we can't parse the position
-                            continue
+                    # Store the full mapped read name
+                    mapped_read_names.add(read_name)
     
-    return mapped_positions
+    return mapped_read_names
+
 
 def build_hierarchical_accounting_map(base_read_name, segments, sam_file='output.sam'):
     """Build accounting map that considers the hierarchical softclip structure"""
-    # Get all mapped softclip positions from SAM file
-    mapped_positions = get_mapped_softclip_positions(base_read_name, sam_file)
+    # Get all mapped softclip read names from SAM file
+    mapped_read_names = get_mapped_softclip_positions(base_read_name, sam_file)
     
-    # Build accounting map for each segment based on its type and path
+    # Build accounting map for each segment based on which nested softclips are mapped
     segment_accounting = {}
     
     for segment in segments:
@@ -928,24 +964,30 @@ def build_hierarchical_accounting_map(base_read_name, segments, sam_file='output
         segment_accounting[segment_read_name] = set()
         
         if segment['type'] == 'main':
-            # For main alignment, check direct softclip positions
-            for mapped_pos in mapped_positions:
-                if len(mapped_pos) == 1:  # Direct softclip from main (e.g., (0,) or (1,))
-                    segment_accounting[segment_read_name].add(mapped_pos)
+            # For main alignment, check if direct softclip reads are mapped
+            # If base_softclip_0 or base_softclip_1 are mapped, account for those positions
+            direct_softclip_0 = f"{base_read_name}_softclip_0"
+            direct_softclip_1 = f"{base_read_name}_softclip_1"
+            
+            if direct_softclip_0 in mapped_read_names:
+                segment_accounting[segment_read_name].add(0.4)  # softclip_0 position
+            if direct_softclip_1 in mapped_read_names:
+                segment_accounting[segment_read_name].add(0.6)  # softclip_1 position
         
         elif segment['type'] == 'softclip':
-            # For softclip segments, check nested softclip positions
-            # Extract the current path from the segment read name
-            if '_softclip_' in segment_read_name:
-                current_path = parse_softclip_path_to_position(segment_read_name, base_read_name)
-                if current_path:
-                    # Check for mapped nested softclips from this path
-                    for mapped_pos in mapped_positions:
-                        # Check if this mapped position is a nested softclip from current path
-                        if len(mapped_pos) > len(current_path) and mapped_pos[:len(current_path)] == current_path:
-                            # This is a nested softclip, so the corresponding position in current segment is accounted for
-                            nested_pos = (mapped_pos[len(current_path)],)
-                            segment_accounting[segment_read_name].add(nested_pos)
+            # For softclip segments, check if nested softclips from this segment are mapped
+            # If they are, then we need to account for the corresponding positions
+            for mapped_read_name in mapped_read_names:
+                # Check if this mapped read is a nested softclip from the current segment
+                if mapped_read_name.startswith(segment_read_name + '_softclip_'):
+                    # Extract what position this nested softclip represents in the current segment
+                    nested_suffix = mapped_read_name[len(segment_read_name):]
+                    if nested_suffix.startswith('_softclip_0'):
+                        # This is a softclip_0 from the current segment, so position 0 is accounted for
+                        segment_accounting[segment_read_name].add(0.4)
+                    elif nested_suffix.startswith('_softclip_1'):
+                        # This is a softclip_1 from the current segment, so position 1 is accounted for  
+                        segment_accounting[segment_read_name].add(0.6)
     
     return segment_accounting
 
@@ -997,7 +1039,7 @@ def merge_split_alignments(base_read_name, reads):
     # Add main alignment segment
     main_ref_pos = int(primary_read[3])
     main_ref_name = primary_read[2]
-    main_seq_pos = (0.5,)  # Between softclip_0 and softclip_1
+    main_seq_pos = 0.5  # Between softclip_0 and softclip_1
     segments.append({
         'ref_pos': main_ref_pos,
         'ref_name': main_ref_name,
@@ -1020,7 +1062,7 @@ def merge_split_alignments(base_read_name, reads):
             'cigar': softclip_read[5]
         })
     
-    # Step 3: Sequence ordering - sort by sequence position tuples
+    # Step 3: Sequence ordering - sort by sequence position
     segments.sort(key=lambda x: x['seq_pos'])
     
     # Step 4: Genomic merging - group contiguous segments
