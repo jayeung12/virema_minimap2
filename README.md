@@ -21,6 +21,8 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
 **New parameter:**
 - `-lr`: Long read technology (ont for Oxford Nanopore, pb for PacBio CLR, hifi for PacBio HiFi)
 
+Seed now acts as a threshold determining whether or not softclips are sent for alignment. Softclip length > Seed -> sent for alignment.
+
 ## Logic
 
 ### 1. Initial Alignment
@@ -32,7 +34,7 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
 - **Purpose**: Broad alignment to identify primary mappings and softclipped regions
 - **Output**: Primary and supplemental alignments with softclipped portions
 
-Short reads that map often have supplemental alignments. ONT reads occassionally have supplemental alignments or multiple primary alignments in different orientations. Only the alignment with the highest alignment score has its softclips sent for additional rounds of alignment.
+Short reads that map often have supplemental alignments. ONT reads occassionally have supplemental alignments or multiple primary alignments in different orientations. Only the alignment with the highest alignment score has its softclips sent for additional rounds of alignment. 1 initial alignment + 5 iterative alignments is the max I have encountered.
 
 ### 2. Softclip Extraction and Re-alignment
 - **Extraction**: Identifies softclipped sequences ≥ threshold length (Seed parameter) from primary alignments
@@ -44,7 +46,7 @@ Short reads that map often have supplemental alignments. ONT reads occassionally
   - **Long reads**: Same technology-specific presets as initial alignment
 - **Purpose**: Detect split alignments indicating potential recombination events
 
-Sometimes, mapping softclips will have further softclips that exceed threshold length. These are sent for another round of mapping where the read name has an additional softclip_0 or softclip_1 appended to the read name in the intermediate file (output.sam). If these softclips map, they are stitched back to the primary alignment in the correct order. Softclips that remain unmapped but are internal (not at the ends of the final, stitched together mapping) are turned into I events in the CIGAR string.
+Sometimes, mapping softclips will have further softclips that exceed threshold length. These are sent for another round of mapping where the read name has an additional softclip_0 or softclip_1 appended to the read name in the intermediate file (output.sam). If these softclips map, they are stitched back to the primary alignment in the correct order. Softclips that remain unmapped but are internal (not at the ends of the final, stitched together mapping) are turned into I events in the CIGAR string. See SOFTCLIP_MERGING_LOGIC.md for more details.
 
 ### 3. Result Merging and Classification
 
@@ -100,5 +102,3 @@ read1  2048  ref    50   255   59H31M          *      0      0     ...  ...   FI
 
 - **Python**: 3.x with standard libraries (`subprocess`, `re`, `argparse`, `collections`)
 - **Minimap2**: Must be available in system PATH
-- **Memory**: Proportional to input size (typically modest requirements)
-- **Storage**: ~3x input file size for intermediate files
