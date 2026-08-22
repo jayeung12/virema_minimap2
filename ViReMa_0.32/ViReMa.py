@@ -1275,8 +1275,6 @@ if __name__ == '__main__':
         call([cfg.Aligner_Directory + 'bowtie-build2', cfg.Lib1, cfg.Lib1])
     elif not exists(cfg.Lib1 + '.amb') and cfg.Aligner == 'bwa':
         call([cfg.Aligner_Directory + 'bwa', 'index', cfg.Lib1])
-    elif not exists(cfg.Lib1 + '.mmi') and cfg.Aligner == 'minimap2':
-        call([cfg.Aligner_Directory + 'minimap2', '-d', cfg.Lib1 + '.mmi', cfg.Lib1])
     else:
         print("Virus Index Found")
     cigar_regex = re.compile(r"[^\W\d_]+|\d+")

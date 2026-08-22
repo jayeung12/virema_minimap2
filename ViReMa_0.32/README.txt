@@ -1,6 +1,8 @@
 ViReMa Version 0.27
 Last Modified: Jun-23
 
+This README is for the original ViReMa without minimap2 functionality. See the other documentation for details on using ViReMa with minimap2.
+
 Test Data - FHV (8 files)
 - FHV_10k.txt		Contains ten thousand reads from the Flock House Virus Dataset: SRP013296
 - FHV_Genome_padded.txt	Contains reference genes for Flock House Virus with long 3' terminal A residues.

@@ -1,0 +1,407 @@
+ViReMa Algorithm Description (minimap2 Backend)
+================================================
+Covers: ViReMa.py, Minimap2_Module.py, Compiler_Module.py, ConfigViReMa.py
+Relevant invocations:
+  1. python ViReMa.py --Aligner minimap2            (short-read mode)
+  2. python ViReMa.py --Aligner minimap2 -lr ont    (Oxford Nanopore mode)
+  3. python ViReMa.py --Aligner minimap2 -lr pb     (PacBio CLR mode)
+
+------------------------------------------------------------------------
+OVERVIEW
+------------------------------------------------------------------------
+ViReMa (Virus Recombination Mapper) detects viral recombination events
+by splitting sequencing reads across multiple genomic alignments. The
+minimap2 backend achieves this by a two-stage strategy:
+
+  Stage 1 - Alignment: minimap2 aligns all reads. Any read that aligns
+  only partially (i.e. produces a soft-clipped SAM record) has its
+  unaligned portion extracted and re-aligned in one or more subsequent
+  rounds. This iterative extraction-and-realignment finds the second
+  (and further) segments of a split read.
+
+  Stage 2 - Compilation: Compiler_Module.py reads the ViReMa-formatted
+  SAM file and tallies recombination junctions, deletions, insertions,
+  and copy-back events into text and BED output files.
+
+The three invocation modes differ only in the minimap2 preset used
+for the initial alignment, how softclipped reads are selected for
+re-alignment, and whether re-alignment is iterated (ONT only).
+
+
+------------------------------------------------------------------------
+PHASE 0 - ARGUMENT PARSING AND SETUP  (ViReMa.py: MainArgs())
+------------------------------------------------------------------------
+Relevant config variables (ConfigViReMa.py) set by MainArgs():
+
+  cfg.Lib1          - Path to virus reference FASTA
+  cfg.File1         - Path to input reads (FASTQ or FASTA)
+  cfg.File3         - Name of the output SAM file
+  cfg.Output_Dir    - Output directory (default: working directory)
+  cfg.Aligner       - Set to 'minimap2' by --Aligner minimap2
+  cfg.LongReadTech  - '' (short read), 'ont', 'pb', or 'hifi';
+                      set by -lr flag only when Aligner == 'minimap2'
+  cfg.Seed          - Minimum aligned length to accept a segment mapping
+                      (default 25 nt); used as SEED_THRESHOLD in
+                      Minimap2_Module
+  cfg.Chunk         - Number of reads per processing chunk (default 1M)
+
+Index building: if no .mmi index file exists for the virus reference,
+ViReMa calls:
+  minimap2 -d <Lib1>.mmi <Lib1>
+
+before entering the alignment stage.
+
+
+------------------------------------------------------------------------
+SITUATION 1: python ViReMa.py --Aligner minimap2
+             (Short-Read Mode, LongReadTech = None)
+------------------------------------------------------------------------
+
+Step 1 - Initial alignment (Minimap2_Module.py: build_minimap2_command,
+                             long_read_tech=None, is_initial=True)
+
+  Command:
+    minimap2 -ax sr -k 20 -A 1 -B 2 -O 1,1 -E 1,1 -r 100 -g 2000
+             -z 2000,1000 -f 0.0001 -n 1 -p 0.05 -N 5 -s 5 -t 8
+             --end-bonus 0 <Lib1> <File1>
+    Output written to: output.sam
+
+  Parameter rationale:
+    -ax sr         - short-read preset (splice-unaware, high sensitivity)
+    -k 20          - k-mer size suitable for accurate short reads
+    -A/-B 1/2      - low mismatch penalty encourages longer alignments
+    -O 1,1 -E 1,1  - very low gap penalties (viral genomes may have
+                     small indels that should not break the alignment)
+    -r 100         - bandwidth for chaining
+    -g 2000        - max intron/gap size during chaining
+    -z 2000,1000   - Z-drop for extension
+    -f 0.0001      - minimizer frequency threshold (reduces repetitive hits)
+    -n 1 -p 0.05   - minimum chaining seeds and secondary alignment ratio
+    -N 5           - up to 5 secondary alignments retained
+    -s 5           - minimum DP score
+    --end-bonus 0  - no bonus for aligning to read ends
+
+Step 2 - Identify soft-clipped primary alignments
+  (Minimap2_Module.py: parse_sam_for_softclipped, long_read_tech=None)
+
+  Reads output.sam and keeps every record that:
+    - is a primary alignment (FLAG bit 2048 not set), AND
+    - contains an 'S' operation in its CIGAR string.
+  When the same read name appears multiple times (multiple primary
+  records), the first record encountered is used.
+
+Step 3 - Extract soft-clipped sequences
+  (Minimap2_Module.py: extract_softclipped_from_cigar_with_positions)
+
+  For each soft-clipped read:
+    - The CIGAR is parsed to locate each 'S' operation.
+    - Soft-clipped sequences are labeled with a position index:
+        _softclip_0  if the clip precedes the main aligned region
+        _softclip_1  if the clip follows the main aligned region
+    - Only sequences >= SEED_THRESHOLD (default 25 nt) are kept.
+    - All qualifying sequences are written to TEMP_READS.txt in
+      FASTA format as:
+        >ReadName_softclip_<0|1>
+        <clipped sequence>
+
+Step 4 - Second-round alignment
+  (Minimap2_Module.py: build_minimap2_command, long_read_tech=None,
+   is_initial=False)
+
+  Command:
+    minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,4 -E 2,1
+             --end-bonus 5 -s 20 -z 200 -r 50
+             <Lib1> ./Test_Data/TEMP_READS.txt
+    Output written to: TEMP_SAM
+
+  Compared with Round 1, this uses a smaller k-mer (-k 10) and a
+  tighter search window (-w 5, -z 200 -r 50) appropriate for the
+  shorter, already-trimmed soft-clip sequences.
+
+Step 5 - Merge TEMP_SAM into output.sam
+  (Minimap2_Module.py: merge_temp_sam_to_output)
+
+  For each base read name that has softclip sub-reads in TEMP_SAM:
+    - All alignments for each softclip identifier are collected.
+    - The alignment with the highest AS (alignment score) tag is
+      selected.
+    - The selected softclip alignments are appended immediately after
+      the original primary alignment line for that base read.
+
+  output.sam now contains, for each split read, the primary alignment
+  followed by the softclip sub-alignment(s).
+
+Step 6 - Convert to ViReMa format
+  (Minimap2_Module.py: convert_to_virema_format)
+
+  Two-pass processing of output.sam:
+    Pass 1: Group all SAM records by base read name.
+    Pass 2: For each base read name:
+      - If the read has only one record (no softclip alignments mapped),
+        the record is passed through with its softclips preserved.
+      - If the read has multiple records (the main alignment plus one or
+        more softclip alignments), merge_split_alignments() is called:
+
+          a. Classify records:
+               - Records without _softclip_ in name and not
+                 supplemental (FLAG & 2048 == 0) are primary candidates.
+               - Records with _softclip_ in name are softclip segments;
+                 their position in read-sequence space is computed
+                 (0.4 = before main, 0.6 = after main, with recursive
+                 sub-intervals for nested clips).
+             The primary candidate with the highest AS score is chosen
+             as the main alignment.
+
+          b. Sort segments by their sequence-space position (seq_pos).
+
+          c. Group contiguous segments: consecutive segments on the same
+             reference sequence with non-overlapping coordinates are
+             joined with an N gap in the CIGAR; segments on different
+             references (or with overlapping/back-splice coordinates)
+             form separate records.
+
+          d. Single contiguous group -> one merged SAM record:
+               CIGAR = <seg1_ops>[<gap>N<seg2_ops>...]
+               Softclip positions accounted for by a downstream
+               softclip alignment are removed from the CIGAR; positions
+               not accounted for become insertions (if internal) or
+               softclips (if at the global read ends).
+
+          e. Multiple groups -> paired SAM records (primary + one or
+             more supplementary, FLAG=2048):
+               Each record carries beginning/end hard clips (H) that
+               represent the portions of the read covered by the other
+               records, and FI:i (fragment index) and TC:i (total count)
+               tags.
+
+      Post-processing on every converted read:
+        - Internal softclips (S operations not at the first or last
+          position of the CIGAR) are converted to insertions (I).
+        - Hardclipped nucleotides are removed from the SEQ and QUAL
+          fields so the sequence matches the CIGAR.
+
+  Converted reads are written in chunks (default 1 M reads) to the
+  final output SAM (cfg.Output_Dir + cfg.File3).
+
+Step 7 - Compilation  (Compiler_Module.py: ResultsSort)
+  See the "Compilation" section at the end of this document.
+
+
+------------------------------------------------------------------------
+SITUATION 2: python ViReMa.py --Aligner minimap2 -lr ont
+             (Oxford Nanopore Mode, LongReadTech = 'ont')
+------------------------------------------------------------------------
+
+Step 1 - Initial alignment (build_minimap2_command, long_read_tech='ont',
+                             is_initial=True)
+
+  Command:
+    minimap2 -ax map-ont -Y <Lib1> <File1>
+    Output written to: output.sam
+
+  Parameter rationale:
+    -ax map-ont  - ONT preset: long reads with ~10-15% error rate;
+                   uses homopolymer-aware k-mers and gap penalties
+                   tuned for nanopore-characteristic indel noise.
+    -Y           - Use soft clipping (rather than hard clipping) for
+                   supplementary alignments, so that the full read
+                   sequence is preserved in every SAM record; this is
+                   critical for the downstream softclip extraction step.
+
+Step 2 - Identify soft-clipped primary alignments
+  (parse_sam_for_softclipped, long_read_tech='ont')
+
+  Same filtering as the short-read case (primary alignment with 'S' in
+  CIGAR), but when a read name has multiple primary-like records, the
+  record with the highest AS score is retained rather than the first.
+  This is important for ONT data where a single long read may generate
+  several overlapping primary hits; choosing the best-scoring one
+  maximizes the chance of correctly anchoring the main alignment.
+
+Step 3 - Extract soft-clipped sequences
+  Identical to the short-read case. Clipped sequences >= SEED_THRESHOLD
+  are written to TEMP_READS.txt with _softclip_0 / _softclip_1 naming.
+
+Step 4 - Iterative alignment  (run_iterative_ont_alignment)
+
+  ONT is the only mode that iterates re-alignment. The loop runs up to
+  10 rounds (max_rounds = 10) and terminates early when a round produces
+  no new softclipped sequences.
+
+  Round 2 alignment command (is_initial=False, long_read_tech='ont'):
+    minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,4 -E 2,1
+             --end-bonus 5 -s 20 -z 200 -r 50
+             <Lib1> ./Test_Data/TEMP_READS.txt
+    Output written to: TEMP_SAM
+
+  Note: although the data originated from ONT, the re-alignment of
+  soft-clip fragments uses short-read parameters (-ax sr). The rationale
+  is that soft-clip fragments are short (>= SEED_THRESHOLD but much
+  shorter than the original read) and must be mapped precisely to
+  identify the exact recombination breakpoint; the relaxed error model
+  of map-ont would produce false-positive placements at this scale.
+
+  Each iteration:
+    a. TEMP_SAM is merged into output.sam (merge_temp_sam_to_output).
+    b. TEMP_SAM is then re-scanned for mapped reads that still carry
+       soft clips (FLAG bit 4 not set AND 'S' in CIGAR).
+    c. New soft-clipped sequences >= SEED_THRESHOLD are extracted and
+       named with nested labels (e.g., ReadName_softclip_1_softclip_0)
+       to track their ancestry through the split-read tree.
+    d. These sequences are written to TEMP_READS_R<N>.txt and aligned
+       in the next round.
+    e. Temporary files from the previous round are deleted to free disk.
+
+  Sequence-space positions for nested clips use a fractional scheme:
+    main alignment          = 0.5
+    main_softclip_0         = 0.4 (before main)
+    main_softclip_1         = 0.6 (after main)
+    main_softclip_0_softclip_1 = 0.45 (between softclip_0 and main)
+  Each additional nesting level halves the offset, ensuring correct
+  ordering without explicit read-coordinate tracking.
+
+Step 5 - Merge and convert
+  After the iterative loop ends, convert_to_virema_format() is called
+  on the merged output.sam. The merging and conversion logic is
+  identical to the short-read case (Steps 5-6 above), but reads may
+  now have more than two segments due to multiple rounds of extraction.
+
+Step 6 - Compilation
+  Identical to the short-read case.
+
+
+------------------------------------------------------------------------
+SITUATION 3: python ViReMa.py --Aligner minimap2 -lr pb
+             (PacBio CLR Mode, LongReadTech = 'pb')
+------------------------------------------------------------------------
+
+Step 1 - Initial alignment (build_minimap2_command, long_read_tech='pb',
+                             is_initial=True)
+
+  Command:
+    minimap2 -ax map-pb <Lib1> <File1>
+    Output written to: output.sam
+
+  Parameter rationale:
+    -ax map-pb   - PacBio CLR preset: long reads with ~10-15% error
+                   rate dominated by substitutions (unlike ONT which is
+                   dominated by indels); tuned k-mer size and scoring
+                   accordingly. The -Y flag is NOT used here, so
+                   supplementary alignments may carry hard clips.
+
+Step 2 - Identify soft-clipped primary alignments
+  (parse_sam_for_softclipped, long_read_tech='pb')
+
+  Same as the short-read case: the first record for each read name is
+  used (not AS-based selection). This is appropriate for PacBio data
+  where the map-pb preset reliably produces a single dominant primary
+  alignment per read.
+
+Step 3 - Extract soft-clipped sequences
+  Identical to the short-read case.
+
+Step 4 - Second-round alignment (build_minimap2_command,
+                                  long_read_tech='pb', is_initial=False)
+
+  The build_minimap2_command function returns the same map-pb command
+  regardless of the is_initial flag:
+    minimap2 -ax map-pb <Lib1> ./Test_Data/TEMP_READS.txt
+    Output written to: TEMP_SAM
+
+  This is unique to PacBio mode: both the initial alignment and the
+  soft-clip re-alignment use the same map-pb preset, which is
+  appropriate since even a short PacBio CLR fragment has the same
+  error profile as the full read. The alignment is NOT iterated; a
+  single second round is performed.
+
+Step 5 - Merge and convert
+  merge_temp_sam_to_output() and convert_to_virema_format() are called
+  identically to the short-read case.
+
+Step 6 - Compilation
+  Identical to the short-read case.
+
+
+------------------------------------------------------------------------
+COMPILATION PHASE  (Compiler_Module.py: ResultsSort; all three modes)
+------------------------------------------------------------------------
+After convert_to_virema_format() writes the final SAM, ViReMa.py calls
+Compiler_Module.ResultsSort(cfg.Output_Dir + cfg.File3).
+
+Pre-compilation steps (ViReMa.py):
+  1. ExtractRefData(): calls bowtie-inspect to retrieve the full
+     nucleotide sequence of each reference in Lib1. The sequences are
+     stored in cfg.Genes and used later to annotate junction contexts.
+  2. Optionally, UniquifyReport() removes PCR duplicates by collating
+     alignment coordinates across multi-segment reads and discarding
+     records with identical coordinate sets.
+  3. If -BED12 is set, FindCoveragefromBED() reads a samtools depth
+     file to populate per-position coverage arrays (cfg.RefsLib1_Coverage)
+     used to annotate junction flanking coverage in the BED output.
+
+ResultsSort() logic:
+  The compiled SAM is read line by line. For each read:
+
+  Single-segment reads (no TC:i tag):
+    - Reads with only match/mismatch operations (no N gaps) are counted
+      as coverage.
+    - Reads with N gaps in their CIGAR represent recombination events:
+        * If the gap size <= MicroInDel_Length: micro-deletion (D event)
+        * If the gap size  > MicroInDel_Length: recombination/splice (N event)
+      These are sorted into per-reference dictionaries.
+    - Reads with I operations (insertions) are tallied separately.
+
+  Multi-segment reads (TC:i:N tag, with FI:i fragment index):
+    - All N segments are read together as a group.
+    - The donor site (end of segment 1) and acceptor site (start of
+      segment 2) are extracted from the RNAME/POS fields and the CIGAR.
+    - The donor and acceptor reference names determine the event class:
+        * Same reference, forward strand: deletion or recombination
+        * Same reference, one reverse-strand: copy-back / snap-back
+        * Different references: intergenic fusion / virus-to-host event
+    - Compound recombination handling (if enabled): the unaligned
+      nucleotides between two recombination junctions are searched in
+      the genomic sequence between the donor and acceptor sites. A match
+      indicates a compound (nested) recombination event, and the single
+      N-gap event is split into two events at the matched position.
+
+  Output files written by WriteFinalDict():
+    - Virus_Recombination_Results.txt and .bed: all within-virus
+      recombination events (deletions, insertions, back-splices).
+    - Virus_MicroIndel_Results.txt and .bed: small indels
+      (size <= MicroInDel_Length).
+    - Virus_Fusions_Results.txt and .bed: inter-segment or
+      inter-reference recombination events.
+    - Host_Recombination_Results.txt, Host_Fusions_Results.txt etc.:
+      equivalent files for host-genome events (if --Host_Index is used).
+
+  Each BED entry includes:
+    - Donor and acceptor coordinates (0-based BED convention)
+    - Event count (number of supporting reads)
+    - Strand
+    - Flanking nucleotide context (Seed nt on each side of junction)
+    - Optional pseudo-reference sequence (if --PseudoRef is set)
+    - Optional flanking coverage (if -BED12 or --Coverage_Offset is set)
+
+
+------------------------------------------------------------------------
+COMPARISON OF THE THREE MODES
+------------------------------------------------------------------------
+
+Feature                 Short-read         ONT               PacBio CLR
+----------------------  -----------------  ----------------  -----------
+Initial preset          -ax sr (custom)    -ax map-ont -Y    -ax map-pb
+-Y soft-clip flag       No                 Yes               No
+Softclip selection      First record       Highest AS score  First record
+Re-alignment preset     -ax sr (relaxed)   -ax sr (relaxed)  -ax map-pb
+Iterative re-alignment  No (single round)  Yes (up to 10x)  No (single round)
+Nested clip naming      _softclip_0/1      _softclip_0/1     _softclip_0/1
+                                           + recursive levels
+Compilation             Identical          Identical         Identical
+
+All modes write a ViReMa-compatible SAM in which each split read is
+represented either as a single record with N gaps in the CIGAR (for
+contiguous recombination on the same reference) or as a primary plus
+supplementary record pair with hard clips (for cross-reference or
+back-splice events). The downstream Compiler_Module is unaware of
+which aligner mode was used.

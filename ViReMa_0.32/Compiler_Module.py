@@ -1053,6 +1053,19 @@ def ResultsSort(File1):
                             Temp.sort(key=lambda a:int(a[0][4]), reverse=True)
                             TargetFile.write("@NewLibrary: " + str(k) + "\n")
                             for i in Temp:
+                                    if cfg.BED:
+                                            if cfg.Lib2:
+                                                    if cfg.MicroInDel_Length > 0:
+                                                            BEDableTargetFiles = [VirusRecs, VirusInsertions, VirusuDels, HostRecs, HostuDels, VirusuIns, HostuIns, VirustoHostRecs]
+                                                    else:
+                                                            BEDableTargetFiles = [VirusRecs, VirusInsertions, HostRecs, VirustoHostRecs]
+                                            else:
+                                                    if cfg.MicroInDel_Length > 0:
+                                                            BEDableTargetFiles = [VirusRecs, VirusInsertions, VirusuDels, VirusuIns]
+                                                    else:
+                                                            BEDableTargetFiles = [VirusRecs, VirusInsertions]
+                                            if TargetFile in BEDableTargetFiles:
+                                                    WritetoBEDFile(k, i[0], TargetFile)
                                     j = '_'.join(i[0])
                                     TargetFile.write(str(j) + "\n")
                                     for Names in i[1]:
@@ -1108,7 +1121,32 @@ def ResultsSort(File1):
         ViraltoHostRecombinationCount = 0
         UnknownRecombinationCount = 0
         UnmappedReadsCount = 0
+        NoiseOnlyCount = 0  # reads with >1 CIGAR segment (fragmented by minor indels) but no gap/event exceeding MicroInDel_Length -- effectively single-locus despite MCount > 1
        # UnknownRecombinations = open(cfg.Output_Dir + cfg.FileTag + "Unknown_Recombinations.txt", "w")
+
+        #Per-read event reconstruction table (long-read workflows only): one row per junction/event,
+        #ordered within each read (segment_index/n_segments), so downstream analysis (e.g. in R) can
+        #group by read_id for the read-level view or filter the table directly for the event-level view.
+        #Not populated for Compound_Handling-resolved events -- out of scope for this table for now.
+        if cfg.LongReadTech:
+            ReadEventsFile = open(cfg.Output_Dir + cfg.FileTag + "Read_Events.tsv", "w")
+            ReadEventsFile.write("read_id\tsegment_index\tn_segments\tevent_type\tchrom1\tpos1\tstrand1\tchrom2\tpos2\tstrand2\tevent_size\n")
+        else:
+            ReadEventsFile = None
+
+        def WriteReadEvent(ReadID, SegmentIndex, NSegs, EvType, Dnr, DnrSite, Acc, AccSite, EvSize):
+            if ReadEventsFile is None:
+                return
+            if Dnr.endswith("_RevStrand"):
+                Chrom1, Strand1 = Dnr[:-10], '-'
+            else:
+                Chrom1, Strand1 = Dnr, '+'
+            if Acc.endswith("_RevStrand"):
+                Chrom2, Strand2 = Acc[:-10], '-'
+            else:
+                Chrom2, Strand2 = Acc, '+'
+            ReadEventsFile.write("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (
+                ReadID, SegmentIndex, NSegs, EvType, Chrom1, DnrSite, Strand1, Chrom2, AccSite, Strand2, EvSize))
 
         ##Allow Gzipped samfile readin
         print(File1)
@@ -1150,6 +1188,7 @@ def ResultsSort(File1):
                 else:
                     Code = ''.join(findall(r"\D", line[-1]))
                     Index = Indices(Code)
+                    NSegments = len(Index[0])
                     MCount = Code.count("M")
                     if "M" not in Code:
                         #UnMapped Read
@@ -1173,7 +1212,10 @@ def ResultsSort(File1):
                         #Multiple mappings, means either recombination, insertion, or substitution.
                         n=0
                         UnRec = ''
+                        HasRealEvent = False
                         for i in Index[0][:-1]:
+                                EventType = None
+                                EventSize = None
                                 Donor = line[i]
                                 #Ref = Donor
                                 if "RevStrand" in line[i+1]:
@@ -1201,10 +1243,12 @@ def ResultsSort(File1):
                                                     Insertion = cfg.Genes[DonorA][int(DonorSite) - 1:int(AcceptorSite)]
                                                     Insertion = Rev_Comp(Insertion)
                                                     NewAcceptorSite = str(int(DonorSite) - 1)
+                                                    EventType, EventSize = "MicroInsertion", len(Insertion)
                                                     AddInsToDict(Donor, DonorSite, NewAcceptorSite, Insertion, uInsDicts, ReadName)
                                             elif int(DonorSite) - int(AcceptorSite) - 1 > 0:
                                                     #MicroDeletion on negative strand
                                                     uCount += 1
+                                                    EventType, EventSize = "MicroDeletion", int(DonorSite) - int(AcceptorSite) - 1
                                                     x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
                                         elif Donor == Acceptor and "_RevStrand" not in Donor and fabs(int(DonorSite) - int(AcceptorSite) + 1) <= cfg.MicroInDel_Length:
                                             if int(DonorSite) - int(AcceptorSite) + 1 > 0:
@@ -1213,14 +1257,21 @@ def ResultsSort(File1):
                                                     DonorA = Donor
                                                     Insertion = cfg.Genes[DonorA][int(AcceptorSite) - 1:int(DonorSite)]
                                                     NewAcceptorSite = str(int(DonorSite) + 1)
+                                                    EventType, EventSize = "MicroInsertion", len(Insertion)
                                                     AddInsToDict(Donor, DonorSite, NewAcceptorSite, Insertion, uInsDicts, ReadName)
                                             elif int(DonorSite) - int(AcceptorSite) + 1 < 0:
                                                     #MicroDeletion
                                                     uCount += 1
+                                                    EventType, EventSize = "MicroDeletion", int(AcceptorSite) - int(DonorSite) - 1
                                                     x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
                                         else:
                                                 #Direct Recombination Event
                                                 RecombCount += 1
+                                                HasRealEvent = True
+                                                if "_RevStrand" in Donor:
+                                                    EventType, EventSize = "Recombination", int(DonorSite) - int(AcceptorSite) - 1
+                                                else:
+                                                    EventType, EventSize = "Recombination", int(AcceptorSite) - int(DonorSite) - 1
                                                 x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
                                                 if Donor in cfg.RefsLib1 and Acceptor in cfg.RefsLib1:
                                                         ViralRecombinationCount +=1
@@ -1242,18 +1293,24 @@ def ResultsSort(File1):
                                             #Simple Insertion Event in negative strand
                                             if len(Insertion) >= cfg.MicroInDel_Length:
                                                 InsCount += 1
+                                                HasRealEvent = True
+                                                EventType, EventSize = "Insertion", len(Insertion)
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, InsDicts, ReadName)
                                             else:
-                                                #MicroInDel on negative strand 
+                                                #MicroInDel on negative strand
                                                 uCount += 1
+                                                EventType, EventSize = "MicroInsertion", len(Insertion)
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, uInsDicts, ReadName)
                                         elif Acceptor == Donor and "_RevStrand" not in Donor and int(AcceptorSite) == (int(DonorSite) + 1):
                                             #Simple Insertion Event
                                             if len(Insertion) >= cfg.MicroInDel_Length:
                                                 InsCount += 1
+                                                HasRealEvent = True
+                                                EventType, EventSize = "Insertion", len(Insertion)
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, InsDicts, ReadName)
                                             else:
                                                 uCount += 1
+                                                EventType, EventSize = "MicroInsertion", len(Insertion)
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, uInsDicts, ReadName)
                                         elif int(AcceptorSite) == (int(DonorSite) + len(Insertion) + 1) and Acceptor == Donor and "_RevStrand" not in Donor:
                                             #Direct Substitution
@@ -1280,6 +1337,8 @@ def ResultsSort(File1):
                                                     
                                             else:
                                                 SubCount += 1
+                                                HasRealEvent = True
+                                                EventType, EventSize = "Substitution", len(Insertion)
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, SubDicts, ReadName)
                                         elif int(DonorSite) == (int(AcceptorSite) + len(Insertion) + 1) and Acceptor == Donor and "_RevStrand" in Donor:
                                             #Direct Substitution on negative strand
@@ -1306,11 +1365,15 @@ def ResultsSort(File1):
                                                         pass
                                             else:
                                                     SubCount += 1
+                                                    HasRealEvent = True
+                                                    EventType, EventSize = "Substitution", len(Insertion)
                                                     AddInsToDict(Donor, AcceptorSite, DonorSite, Insertion, SubDicts, ReadName)
                                         else:
                                                 if len(Insertion) >= int(cfg.Seed) or len(Insertion) >= int(cfg.Host_Seed):
                                                     #Mapable Insertion/Recombination
                                                     UnknownRecombinationCount += 1
+                                                    HasRealEvent = True
+                                                    EventType, EventSize = "UnknownRecombination", len(Insertion)
                                                     UnRec = 'Y'
                                                 else:
                                                     if cfg.Compound_Handling and len(Insertion) > int(cfg.Compound_Handling) and Donor == Acceptor and Donor in cfg.RefsLib1:
@@ -1321,15 +1384,100 @@ def ResultsSort(File1):
                                                             RecombCount += 2
                                                             ViralRecombinationCount += 2
                                                             CompoundCount += 1
+                                                            HasRealEvent = True
                                                         else:
                                                             #Unknown Compound
                                                             UnRec = 'Y'
                                                             UnknownRecombinationCount += 1
+                                                            HasRealEvent = True
+                                                    elif cfg.LongReadTech and (Donor in cfg.RefsLib1 or Donor in cfg.RefsLib2) and (Acceptor in cfg.RefsLib1 or Acceptor in cfg.RefsLib2):
+                                                        # Guard: Donor/Acceptor must be recognized reference names (not,
+                                                        # e.g., raw sequence data from a mis-indexed field on some other
+                                                        # read shape -- a pre-existing indexing issue, unrelated to this
+                                                        # change, that surfaced because this is the first code path in
+                                                        # this branch that needs Donor/Acceptor to be real chromosome
+                                                        # names rather than just printing them). Falls back to the
+                                                        # original UnknownInsertion path below when not recognized,
+                                                        # matching pre-existing behavior for that edge case.
+                                                        #
+                                                        # Residual < Seed, long-read only -- too small to ever be
+                                                        # independently seed-mappable (ViReMa's own existing definition
+                                                        # of noise, matching the len(seq) >= SEED_THRESHOLD gates used
+                                                        # throughout Minimap2_Module.py), so this is ordinary noise
+                                                        # sitting at a real junction, not a second event to solve for.
+                                                        # Classify the underlying Donor/Acceptor jump exactly as the
+                                                        # clean-adjacency block above does (by jump size), and when it
+                                                        # resolves to a real Recombination, ALSO separately record the
+                                                        # residual itself as its own MicroInsertion rather than
+                                                        # silently discarding it.
+                                                        if Donor == Acceptor and "_RevStrand" in Donor and fabs(int(DonorSite) - int(AcceptorSite) - 1) <= cfg.MicroInDel_Length:
+                                                            if int(DonorSite) - int(AcceptorSite) - 1 < 0:
+                                                                    #MicroInsertion on negative strand
+                                                                    uCount += 1
+                                                                    DonorA = Donor[:-10]
+                                                                    MicroInsContent = cfg.Genes[DonorA][int(DonorSite) - 1:int(AcceptorSite)]
+                                                                    MicroInsContent = Rev_Comp(MicroInsContent)
+                                                                    NewAcceptorSite = str(int(DonorSite) - 1)
+                                                                    EventType, EventSize = "MicroInsertion", len(MicroInsContent)
+                                                                    AddInsToDict(Donor, DonorSite, NewAcceptorSite, MicroInsContent, uInsDicts, ReadName)
+                                                            elif int(DonorSite) - int(AcceptorSite) - 1 > 0:
+                                                                    #MicroDeletion on negative strand
+                                                                    uCount += 1
+                                                                    EventType, EventSize = "MicroDeletion", int(DonorSite) - int(AcceptorSite) - 1
+                                                                    x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                        elif Donor == Acceptor and "_RevStrand" not in Donor and fabs(int(DonorSite) - int(AcceptorSite) + 1) <= cfg.MicroInDel_Length:
+                                                            if int(DonorSite) - int(AcceptorSite) + 1 > 0:
+                                                                    #MicroInsertion
+                                                                    uCount += 1
+                                                                    DonorA = Donor
+                                                                    MicroInsContent = cfg.Genes[DonorA][int(AcceptorSite) - 1:int(DonorSite)]
+                                                                    NewAcceptorSite = str(int(DonorSite) + 1)
+                                                                    EventType, EventSize = "MicroInsertion", len(MicroInsContent)
+                                                                    AddInsToDict(Donor, DonorSite, NewAcceptorSite, MicroInsContent, uInsDicts, ReadName)
+                                                            elif int(DonorSite) - int(AcceptorSite) + 1 < 0:
+                                                                    #MicroDeletion
+                                                                    uCount += 1
+                                                                    EventType, EventSize = "MicroDeletion", int(AcceptorSite) - int(DonorSite) - 1
+                                                                    x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                        else:
+                                                                #Direct Recombination Event (reached via a small residual
+                                                                #junction instead of pixel-perfect adjacency)
+                                                                RecombCount += 1
+                                                                HasRealEvent = True
+                                                                if "_RevStrand" in Donor:
+                                                                    EventType, EventSize = "Recombination", int(DonorSite) - int(AcceptorSite) - 1
+                                                                else:
+                                                                    EventType, EventSize = "Recombination", int(AcceptorSite) - int(DonorSite) - 1
+                                                                x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
+                                                                if Donor in cfg.RefsLib1 and Acceptor in cfg.RefsLib1:
+                                                                        ViralRecombinationCount +=1
+                                                                elif Donor in cfg.RefsLib2 and Acceptor in cfg.RefsLib2:
+                                                                        HostRecombinationCount += 1
+                                                                else:
+                                                                        ViraltoHostRecombinationCount += 1
+                                                                #Also record the residual itself as its own MicroInsertion
+                                                                #rather than discarding it -- both are real, independently
+                                                                #informative signals for this junction.
+                                                                uCount += 1
+                                                                AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, uInsDicts, ReadName)
                                                     else:
                                                         #Unknown Insertion.
                                                         UnknownRecombinationCount += 1
+                                                        HasRealEvent = True
+                                                        EventType, EventSize = "UnknownInsertion", len(Insertion)
                                                         UnRec = 'Y'
-                                n+=1 
+                                if EventType is not None:
+                                    WriteReadEvent(ReadName, n+1, NSegments, EventType, Donor, DonorSite, Acceptor, AcceptorSite, EventSize)
+                                n+=1
+                        if not HasRealEvent:
+                                #Every gap/event in this read fell within the MicroInDel_Length noise threshold --
+                                #effectively a single-locus read despite MCount > 1. The MCount==1 branch above only
+                                #recognizes a literal single-CIGAR-op read, which routine long-read sequencing noise
+                                #(many small I/D ops) almost never produces, so these reads were previously left out
+                                #of any "singly mapped" tally entirely.
+                                NoiseOnlyCount += 1
+                        else:
+                                pass
                         if UnRec:
                                 pass#UnknownRecombinations.write(wholeline)
                         else:
@@ -1403,6 +1551,7 @@ def ResultsSort(File1):
         print("---------------------------------------------------------------------------------------------------------------------")
         print("Total of %s reads have been analysed:" % Totalcount)
         print("%s were single mapping reads with pads, %s of which were longer than the chosen seed (%s nts)." % (Padcount, LongPadcount, cfg.Seed))
+        print("%s additional reads had multiple CIGAR segments (fragmented by minor indels) but no event exceeding MicroInDel_Length -- effectively single-locus." % NoiseOnlyCount)
         print("%s Straight-forward Recombination Events detected"% RecombCount)
         print("of which %s were Viral Recombinations, %s were Host Recombinations and %s were Virus-to-Host Recombinations" % (ViralRecombinationCount, HostRecombinationCount, ViraltoHostRecombinationCount))
         if cfg.MicroInDel_Length > 0:
@@ -1421,6 +1570,8 @@ def ResultsSort(File1):
         #Close all output files and finish
         InRecombs.close()
         #UnknownRecombinations.close()
+        if ReadEventsFile is not None:
+                ReadEventsFile.close()
         VirusRecs.close()
         if cfg.MicroInDel_Length > 0:
                 VirusuIns.close()
