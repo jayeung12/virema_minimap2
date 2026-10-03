@@ -1269,7 +1269,11 @@ if __name__ == '__main__':
     else:
         pass#   print("Aligner Directory must be in PATH/Registry or be assigned using --Aligner_Directory.")
     print("Output Directory =", cfg.Output_Dir)
-    if not exists(cfg.Lib1 + '.1.ebwt') and cfg.Aligner == 'bowtie':
+    if not exists(cfg.Lib1 + '.1.ebwt') and cfg.Aligner in ('bowtie', 'minimap2'):
+        # minimap2 itself builds its own index on the fly from the raw FASTA and never touches
+        # this file -- but Compiler_Module.ExtractRefData() still calls bowtie-inspect on cfg.Lib1
+        # (for both aligners, to pull reference names/sequences for the output), so a bowtie-format
+        # index is required regardless of which aligner actually did the read mapping.
         call([cfg.Aligner_Directory + 'bowtie-build', cfg.Lib1, cfg.Lib1])
     elif not exists(cfg.Lib1 + '.1.bt2') and cfg.Aligner == 'bowtie2':
         call([cfg.Aligner_Directory + 'bowtie-build2', cfg.Lib1, cfg.Lib1])

@@ -23,6 +23,16 @@ python ViReMa.py --Aligner minimap2 -lr ont  --Seed 25 Test_Data/SARS2_Genome.fa
 
 Seed now acts as a threshold determining whether or not softclips are sent for alignment. Softclip length > Seed -> sent for alignment.
 
+**Defunct flags with `--Aligner minimap2`** (short- or long-read mode): these are standard ViReMa
+arguments that only apply to the bowtie/bowtie2/bwa alignment path and have no effect here --
+`--X`, `--ThreePad`, `--FivePad`, `--ErrorDensity`, `--MaxIters`, `--Internal_Pad`, `-Windows`,
+`-Fasta`, `--Pad`, `--Host_Index`, `--Host_Seed`. `--Host_Index` in particular is a dead end rather
+than a no-op: it still builds a host bowtie index, but `Minimap2_Module.py` has no host-alignment
+step at all, so no read is ever aligned against it and the Host_* output files stay empty.
+`--Aligner_Directory` does work here (it redirects the `minimap2` call the same way it redirects
+bowtie/bwa), and `--N` has no effect on the minimap2 alignment itself but still affects substitution
+classification during compilation.
+
 ## Logic
 
 ### 1. Initial Alignment

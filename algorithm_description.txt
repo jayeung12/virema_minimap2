@@ -477,6 +477,11 @@ ResultsSort() logic:
       inter-reference recombination events.
     - Host_Recombination_Results.txt, Host_Fusions_Results.txt etc.:
       equivalent files for host-genome events (if --Host_Index is used).
+      NOTE: --Host_Index (and --Host_Seed) are a dead end with the
+      minimap2 aligner, short- or long-read mode. Minimap2_Module.py has
+      no host-genome alignment step at all, so no read is ever aligned
+      against the host genome and these files stay empty; the flags only
+      do anything with --Aligner bowtie/bowtie2/bwa.
 
   Each BED entry includes:
     - Donor and acceptor coordinates (0-based BED convention; for a

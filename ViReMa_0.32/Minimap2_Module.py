@@ -16,6 +16,9 @@ SEED_THRESHOLD = 25  # Default threshold
 MICROINDEL_THRESHOLD = 0  # Default threshold (below this, an indel is ordinary noise)
 CHUNK_SIZE = 1000000  # Default chunk size for memory-efficient processing (1M reads, matching ViReMa)
 THREADS = '1'  # Default thread count
+ALIGNER_DIRECTORY = ''  # cfg.Aligner_Directory, already formatted with a trailing slash (or '' if
+                         # unset) by ViReMa.py -- prefixed onto 'minimap2' the same way ViReMa.py
+                         # itself prefixes it onto 'bowtie'/'bwa'/'bowtie2' everywhere they're called
 
 # Long-read technologies that get the full multi-round rescue treatment (embedded-insertion
 # rewrite every round, iterative softclip realignment up to max_rounds, segment-pair
@@ -28,7 +31,7 @@ def run_minimap2_workflow(config):
     Main entry point for minimap2 workflow when called from ViReMa
     Uses ViReMa configuration parameters
     """
-    global VIRUS_INDEX, INPUT_DATA, OUTPUT_SAM, SEED_THRESHOLD, MICROINDEL_THRESHOLD, CHUNK_SIZE, THREADS
+    global VIRUS_INDEX, INPUT_DATA, OUTPUT_SAM, SEED_THRESHOLD, MICROINDEL_THRESHOLD, CHUNK_SIZE, THREADS, ALIGNER_DIRECTORY
 
     # Set parameters from ViReMa config
     VIRUS_INDEX = config.Lib1
@@ -37,6 +40,7 @@ def run_minimap2_workflow(config):
     SEED_THRESHOLD = int(config.Seed) if config.Seed else 25
     MICROINDEL_THRESHOLD = int(config.MicroInDel_Length) if config.MicroInDel_Length else 0
     THREADS = config.Threads if config.Threads else '1'
+    ALIGNER_DIRECTORY = config.Aligner_Directory if getattr(config, 'Aligner_Directory', None) else ''
 
     # Use ViReMa's chunk size if available, otherwise use default
     if hasattr(config, 'Chunk') and config.Chunk:
@@ -133,7 +137,7 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
     """Build minimap2 command based on technology and round"""
     if long_read_tech == 'ont':
         if is_initial:
-            return ['minimap2', '-a', '-k', '15', '-w', '5',
+            return [ALIGNER_DIRECTORY + 'minimap2', '-a', '-k', '15', '-w', '5',
                     '-A', '1', '-B', '2', '-O', '2,32', '-E', '1,0',
                     '-z', '200', '-g', '2000', '-Y',
                     '-t', THREADS, VIRUS_INDEX, input_file]
@@ -143,24 +147,24 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
             # of soft-clipping it for proper rescue, silently absorbing true junctions (verified
             # directly on two misses: S1_53/combo-HiFi and S1_2/combo-HiFi -- raising O2 to 8
             # recovered a clean second-locus split in both, confirmed against raw sequence).
-            return ['minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
                     '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
     elif long_read_tech == 'pb':
         if is_initial:
-            return ['minimap2', '-ax', 'map-pb', '-t', THREADS, VIRUS_INDEX, input_file]
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'map-pb', '-t', THREADS, VIRUS_INDEX, input_file]
         else:
             # Round 2+ rescue: realigning a short extracted fragment, not a whole read --
             # map-pb (tuned for whole long reads) fails outright on short queries based on tests with synthetic data.
             # -O 2,8: see the ONT round-2+ comment above for the gap-cost rationale.
-            return ['minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
                     '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
     elif long_read_tech == 'hifi':
         if is_initial:
-            return ['minimap2', '-ax', 'map-hifi', '-t', THREADS, VIRUS_INDEX, input_file]
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'map-hifi', '-t', THREADS, VIRUS_INDEX, input_file]
         else:
             # Round 2+ rescue, same rationale as the 'pb' branch above -- map-hifi fails
             # outright on short fragments for the same reason map-pb does. Same short-read
@@ -168,7 +172,7 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
             # lower error rate (~96.5%+ vs ~85%) doesn't need ONT/CLR's extra seed sensitivity,
             # and a larger, more specific minimizer would supposedly reduce spurious short-repeat matches.
             # -O 2,8: see the ONT round-2+ comment above for the gap-cost rationale.
-            return ['minimap2', '-ax', 'sr', '-k', '15', '-w', '5', '-m', '10',
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'sr', '-k', '15', '-w', '5', '-m', '10',
                     '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
@@ -176,13 +180,13 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
         if is_initial:
             import os
             k_val = os.environ.get('VIREMA_MM2_SR_K', '20')
-            return ['minimap2', '-ax', 'sr', '-k', k_val, '-A', '1', '-B', '2',
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'sr', '-k', k_val, '-A', '1', '-B', '2',
                     '-O', '2,8', '-g', '2000',
                     '-z', '800,400', '-n', '1', '-p', '0.3',
                     '-N', '3', '-s', '20', '-t', THREADS, '--end-bonus', '0',
                     VIRUS_INDEX, input_file]
         else:
-            return ['minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
+            return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
                     '-n', '2', '-A', '1', '-B', '2', '-O', '12,32', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
