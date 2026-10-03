@@ -20,9 +20,7 @@ THREADS = '1'  # Default thread count
 # Long-read technologies that get the full multi-round rescue treatment (embedded-insertion
 # rewrite every round, iterative softclip realignment up to max_rounds, segment-pair
 # preservation, redundant-segment dedup). All of this logic is itself tech-agnostic -- it
-# operates on CIGAR/SAM content, not on which aligner preset produced it -- so extending it
-# beyond 'ont' is just a matter of routing 'pb'/'hifi' through the same path instead of the
-# single-round fallback used for plain short-read mode.
+# operates on CIGAR/SAM content, not on which aligner preset produced it.
 ITERATIVE_RESCUE_TECHS = ('ont', 'pb', 'hifi')
 
 def run_minimap2_workflow(config):
@@ -39,23 +37,23 @@ def run_minimap2_workflow(config):
     SEED_THRESHOLD = int(config.Seed) if config.Seed else 25
     MICROINDEL_THRESHOLD = int(config.MicroInDel_Length) if config.MicroInDel_Length else 0
     THREADS = config.Threads if config.Threads else '1'
-    
+
     # Use ViReMa's chunk size if available, otherwise use default
     if hasattr(config, 'Chunk') and config.Chunk:
         CHUNK_SIZE = int(config.Chunk)
     else:
         CHUNK_SIZE = 1000000  # Default 1M reads
-    
+
     # Determine long read technology (empty string means short read mode)
     long_read_tech = config.LongReadTech if config.LongReadTech else None
-    
+
     print(f"Minimap2 parameters:")
     print(f"  Virus Index: {VIRUS_INDEX}")
     print(f"  Input Data: {INPUT_DATA}")
     print(f"  Output SAM: {OUTPUT_SAM}")
     print(f"  Seed Threshold: {SEED_THRESHOLD}")
     print(f"  Long Read Tech: {long_read_tech if long_read_tech else 'short read'}")
-    
+
     # Run the minimap2 workflow
     try:
         # Step 1: Run initial minimap2 alignment
@@ -65,21 +63,20 @@ def run_minimap2_workflow(config):
         print("Initial minimap2 alignment completed")
 
         # Step 1b: Convert any large embedded insertions into explicit soft-clips so the
-        # existing rescue pipeline below finds them like any other soft-clipped read (see
-        # rewrite_embedded_insertions_as_softclips docstring for why this is needed).
+        # existing rescue pipeline below finds them like any other soft-clipped read.
         if long_read_tech in ITERATIVE_RESCUE_TECHS:
             rewrite_embedded_insertions_as_softclips('output.sam', MICROINDEL_THRESHOLD, SEED_THRESHOLD)
 
         # Step 2: Parse SAM for softclipped reads with only primary alignment
         softclipped_reads = parse_sam_for_softclipped(long_read_tech)
-        
+
         if softclipped_reads:
-            # Step 3: Save to multiRound file (debugging)
+            # Step 3: Save to multiRound file (this was mainly for debugging but can be informative in real runs)
             with open('multiRound', 'w') as f:
                 for read_name, data in softclipped_reads.items():
                     f.write(data['line'] + '\n')
             print(f"Saved {len(softclipped_reads)} softclipped reads to multiRound")
-            
+
             # Step 4: Extract softclipped sequences
             temp_sequences = []
             for read_name, data in softclipped_reads.items():
@@ -102,7 +99,7 @@ def run_minimap2_workflow(config):
             with open('./Test_Data/TEMP_READS.txt', 'w') as f:
                 for read_name, seq in temp_sequences:
                     f.write(f">{read_name}\n{seq}\n")
-            
+
             # Step 5: Run second minimap2 alignment (iterative for ont/pb/hifi)
             if long_read_tech in ITERATIVE_RESCUE_TECHS:
                 run_iterative_ont_alignment(long_read_tech)
@@ -118,14 +115,14 @@ def run_minimap2_workflow(config):
             if long_read_tech not in ITERATIVE_RESCUE_TECHS:
                 merge_temp_sam_to_output('./TEMP_SAM')
                 print("Results merged back into output.sam with grouped reads")
-        
+
         # Step 7: Convert to ViReMa format
         convert_to_virema_format()
         print(f"Minimap2 workflow completed. Output saved to: {OUTPUT_SAM}")
-        
+
         # Clear cache to free memory after processing
         clear_softclip_cache()
-        
+
     except Exception as e:
         print(f"Error in minimap2 workflow: {e}")
         # Clear cache even on error to free memory
@@ -141,8 +138,13 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
                     '-z', '200', '-g', '2000', '-Y',
                     '-t', THREADS, VIRUS_INDEX, input_file]
         else:
+            # -O 2,8 (long-gap open raised from the stock 4): a cheap long-gap cost let this
+            # preset "limp through" a real second-locus fragment via many small indels instead
+            # of soft-clipping it for proper rescue, silently absorbing true junctions (verified
+            # directly on two misses: S1_53/combo-HiFi and S1_2/combo-HiFi -- raising O2 to 8
+            # recovered a clean second-locus split in both, confirmed against raw sequence).
             return ['minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
-                    '-n', '2', '-A', '2', '-B', '2', '-O', '2,4', '-E', '2,1',
+                    '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
     elif long_read_tech == 'pb':
@@ -150,14 +152,10 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
             return ['minimap2', '-ax', 'map-pb', '-t', THREADS, VIRUS_INDEX, input_file]
         else:
             # Round 2+ rescue: realigning a short extracted fragment, not a whole read --
-            # map-pb (tuned for whole long reads) fails outright on short queries (confirmed
-            # empirically: a 167bp fragment came back completely unmapped under map-pb but
-            # aligned cleanly, MAPQ 60, under this preset). Same base as ONT's round-2+ preset,
-            # since CLR and ONT are both ~85%-accuracy long-read technologies facing the same
-            # short-fragment-sensitivity problem -- reusing already-validated parameters here
-            # rather than inventing new, untested ones for a comparable error regime.
+            # map-pb (tuned for whole long reads) fails outright on short queries based on tests with synthetic data.
+            # -O 2,8: see the ONT round-2+ comment above for the gap-cost rationale.
             return ['minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
-                    '-n', '2', '-A', '2', '-B', '2', '-O', '2,4', '-E', '2,1',
+                    '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
     elif long_read_tech == 'hifi':
@@ -168,14 +166,17 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
             # outright on short fragments for the same reason map-pb does. Same short-read
             # base preset as ONT/PB's round-2+, but with a larger k (15 vs 10): HiFi's much
             # lower error rate (~96.5%+ vs ~85%) doesn't need ONT/CLR's extra seed sensitivity,
-            # and a larger, more specific minimizer reduces spurious short-repeat matches.
+            # and a larger, more specific minimizer would supposedly reduce spurious short-repeat matches.
+            # -O 2,8: see the ONT round-2+ comment above for the gap-cost rationale.
             return ['minimap2', '-ax', 'sr', '-k', '15', '-w', '5', '-m', '10',
-                    '-n', '2', '-A', '2', '-B', '2', '-O', '2,4', '-E', '2,1',
+                    '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
                     '-t', THREADS, VIRUS_INDEX, input_file]
     else:
         if is_initial:
-            return ['minimap2', '-ax', 'sr', '-k', '20', '-A', '1', '-B', '2',
+            import os
+            k_val = os.environ.get('VIREMA_MM2_SR_K', '20')
+            return ['minimap2', '-ax', 'sr', '-k', k_val, '-A', '1', '-B', '2',
                     '-O', '2,8', '-g', '2000',
                     '-z', '800,400', '-n', '1', '-p', '0.3',
                     '-N', '3', '-s', '20', '-t', THREADS, '--end-bonus', '0',
@@ -208,13 +209,13 @@ def parse_sam_for_softclipped(long_read_tech=None):
         return not (flag & 2048) and 'S' in cigar  # Not supplemental and has softclip
 
     alignments = parse_sam_file('output.sam', is_primary_with_softclip)
-    
+
     # Group alignments by read name
     read_alignments = defaultdict(list)
     for fields in alignments:
         read_name = fields[0]
         read_alignments[read_name].append(fields)
-    
+
     # Process alignments based on technology
     softclipped_reads = {}
     for read_name, alignment_list in read_alignments.items():
@@ -241,7 +242,7 @@ def parse_sam_for_softclipped(long_read_tech=None):
                 'sequence': fields[9],
                 'ins_len': _get_ins_len_tag(fields)
             }
-    
+
     return softclipped_reads
 
 
@@ -342,8 +343,7 @@ def rewrite_embedded_insertions_as_softclips(sam_file, microindel_threshold, see
     there is then no soft-clip left for the existing rescue mechanism to ever notice. Turning
     "...M<bigI>M..." into "...M<S covering bigI + everything after it>" makes it look exactly
     like an ordinary soft-clipped read: the clipped piece starts right at the insertion
-    boundary, and when minimap2 realigns just that piece fresh, empirically (see loc2_S1_16 in
-    the FHV benchmark this was built for) it reliably produces a correct primary+supplementary
+    boundary, and when minimap2 realigns just that piece fresh, it reliably produces a correct primary+supplementary
     split, because there's now ~0 flanking context on one side to tempt it into re-embedding.
 
     Deletions ('D'/'N' ops) are never touched -- only 'I' -- so this cannot affect deletion
@@ -440,9 +440,9 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
             flag = int(fields[1])
             cigar = fields[5]
             return not (flag & 4) and 'S' in cigar  # Mapped and has softclip
-        
+
         alignments = parse_sam_file(temp_sam_file, is_mapped_with_softclip)
-        
+
         new_softclips = []
         for fields in alignments:
             read_name = fields[0]
@@ -512,33 +512,34 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
 def calculate_sequence_position(read_name, base_read_name):
     """
     Calculate sequence position for a softclip read based on its path.
-    
+    This is to maintain the ordering of read fragments for downstream reporting.
+
     The position represents where in the sequence this segment should appear:
     - Main alignment is at position 0.5
     - softclip_0 variants appear before their parent (subtract offset)
     - softclip_1 variants appear after their parent (add offset)
     - Each nesting level uses smaller offsets to maintain proper ordering
-    
+
     Examples:
     - main: 0.5
     - main_softclip_0: 0.4 (before main)
     - main_softclip_0_softclip_1: 0.45 (between softclip_0 and main)
     - main_softclip_1: 0.6 (after main)
     - main_softclip_1_softclip_0: 0.55 (between main and softclip_1)
-    
+
     Returns: float representing sequence position, or None if not a softclip read
     """
     if '_softclip_' not in read_name:
         return None  # Not a softclip read
-    
+
     # Remove base read name to get just the softclip path
     softclip_path = read_name.replace(base_read_name + '_', '')
-    
+
     # Split by 'softclip_' and extract the indices
     parts = softclip_path.split('softclip_')
     if len(parts) < 2:
         return None
-    
+
     # Extract position indices from the path
     path_indices = []
     for i in range(1, len(parts)):  # Skip the first empty part
@@ -550,35 +551,35 @@ def calculate_sequence_position(read_name, base_read_name):
         except ValueError:
             # If we can't parse an index, skip it
             continue
-    
+
     if not path_indices:
         return None
-    
+
     # Calculate position by walking the path
     # Start from main alignment position
     position = 0.5
-    
+
     # Each step in the path adjusts position
     # Use decreasing offsets for each level to maintain proper ordering
     base_offset = 0.1
-    
+
     for level, direction in enumerate(path_indices):
         # Calculate offset for this level (smaller for deeper nesting)
         level_offset = base_offset / (2 ** level)
-        
+
         if direction == 0:
             # softclip_0: move to earlier position (before parent)
             position -= level_offset
         elif direction == 1:
             # softclip_1: move to later position (after parent)
             position += level_offset
-    
+
     return position
 
 def get_sequence_position_for_read(read_name, base_read_name, primary_cigar):
     """
     Determine the sequence position for a read based on softclip path or main alignment.
-    
+
     Returns: float that can be used for sorting reads in sequence order
     """
     if '_softclip_' in read_name:
@@ -592,14 +593,14 @@ def select_best_alignment_by_as(alignments):
     """Select the best alignment from a list based on AS (alignment score)"""
     if not alignments:
         return None
-    
+
     def get_as_score(alignment_line):
         fields = alignment_line.strip().split('\t')
         for field in fields[11:]:
             if field.startswith('AS:i:'):
                 return int(field.split(':')[2])
         return 0
-    
+
     # Select alignment with highest AS score
     best_alignment = max(alignments, key=get_as_score)
     return best_alignment
@@ -634,7 +635,7 @@ def merge_temp_sam_to_output(temp_sam_file):
     # Load original reads
     original_headers = []
     original_reads = {}
-    
+
     with open('output.sam', 'r') as f:
         for line in f:
             if line.startswith('@'):
@@ -644,7 +645,7 @@ def merge_temp_sam_to_output(temp_sam_file):
                 if read_name not in original_reads:
                     original_reads[read_name] = []
                 original_reads[read_name].append(line)
-    
+
     # Load temp reads with base name extraction and AS-based selection
     temp_reads = {}
     try:
@@ -655,7 +656,7 @@ def merge_temp_sam_to_output(temp_sam_file):
                     read_name = fields[0]
                     # Extract base read name from nested softclip names
                     base_read_name = read_name.split('_softclip_')[0]
-                    
+
                     # If this is a softclip read, we need to consider all alignments (including supplementary)
                     if '_softclip_' in read_name:
                         # Extract the softclip identifier (e.g., "read1_softclip_0"). An "_ins"
@@ -668,13 +669,13 @@ def merge_temp_sam_to_output(temp_sam_file):
                         _digit = _suffix.split('_')[0]
                         _ins_marker = '_ins' if _suffix.endswith('_ins') else ''
                         softclip_identifier = read_name.rsplit('_softclip_', 1)[0] + '_softclip_' + _digit + _ins_marker
-                        
+
                         if base_read_name not in temp_reads:
                             temp_reads[base_read_name] = {}
-                        
+
                         if softclip_identifier not in temp_reads[base_read_name]:
                             temp_reads[base_read_name][softclip_identifier] = []
-                        
+
                         temp_reads[base_read_name][softclip_identifier].append(line)
                     else:
                         # Regular read (not softclip)
@@ -691,7 +692,7 @@ def merge_temp_sam_to_output(temp_sam_file):
     selected_temp_reads = {}
     for base_read_name, read_groups in temp_reads.items():
         selected_temp_reads[base_read_name] = []
-        
+
         for identifier, alignments in read_groups.items():
             if identifier == 'regular':
                 # For regular reads, just add all alignments
@@ -734,7 +735,7 @@ def convert_to_virema_format():
     """Convert minimap2 output to ViReMa-like format with chunked processing"""
     import re
     import os
-    
+
     # Check file size for memory optimization guidance
     try:
         file_size = os.path.getsize('output.sam')
@@ -795,26 +796,26 @@ def convert_to_virema_format():
 
     # Clear processed_reads after filtering to save memory
     processed_reads = None
-    
+
     # Memory-efficient chunked processing and writing
     print("Converting reads to ViReMa format...")
     final_converted_reads = []
     total_converted = 0
     chunk_count = 0
-    
+
     # Open output file for writing
     with open(OUTPUT_SAM, 'w') as output_file:
         # Write headers first
         for header in headers:
             output_file.write(header)
-        
+
         # Process reads in chunks
         current_chunk = []
         base_read_names = list(read_groups.keys())
-        
+
         for i, base_read_name in enumerate(base_read_names):
             reads = read_groups[base_read_name]
-            
+
             if len(reads) == 1:
                 # Single alignment - preserve softclips since they didn't map anywhere else or fell below threshold
                 read = reads[0]
@@ -832,18 +833,18 @@ def convert_to_virema_format():
                     else:
                         # Single merged record case - list of fields
                         current_chunk.append(merged_result)
-            
+
             # Process chunk when it reaches the specified size or at the end
             if len(current_chunk) >= CHUNK_SIZE or i == len(base_read_names) - 1:
                 if current_chunk:
                     chunk_count += 1
                     print(f"Processing chunk {chunk_count} with {len(current_chunk):,} reads...")
-                    
+
                     # Apply final post-processing: convert internal softclips to insertions
                     for read in current_chunk:
                         # Update hardclipped sequences and quality scores first
                         update_hardclipped_values(read)
-                        
+
                         # Apply internal softclip to insertion conversion
                         if read[5] != '*':  # Only process reads with valid CIGAR
                             cigar_ops = re.findall(r'(\d+)([MIDNSHPX=])', read[5])
@@ -856,11 +857,11 @@ def convert_to_virema_format():
                                     else:
                                         new_ops.append(f"{length}{op}")
                                 read[5] = ''.join(new_ops)
-                        
+
                         # Write read immediately to avoid memory accumulation
                         output_file.write('\t'.join(read) + '\n')
                         total_converted += 1
-                    
+
                     # Clear chunk to free memory
                     current_chunk = []
 
@@ -884,7 +885,11 @@ def convert_single_read(read_fields, preserve_softclips=False):
 
     # Create new read with simplified tags
     new_read = read_fields.copy()
-    new_read[1] = '0'    # Set flag to 0 for mapped reads
+    new_read[1] = str(flag & 16)  # Clear all flag bits except strand (preserve reverse-strand
+                                   # reads as reverse -- previously hard-coded to '0'/forward
+                                   # regardless of the record's true strand, which silently
+                                   # discarded correctly-detected reverse-strand alignments
+                                   # (e.g. inversions) before classification ever saw them)
     new_read[4] = '255'  # Set MAPQ to 255 for mapped reads
     new_read[5] = new_cigar
 
@@ -942,56 +947,89 @@ def calculate_genomic_end_position(ref_pos, cigar):
     genomic_span = sum(int(l) for l, o in cigar_ops if o in 'MDN=X')
     return ref_pos + genomic_span - 1
 
+def _segment_strand(segment):
+    """0 (forward) or 16 (reverse) -- this segment's strand relative to the shared query frame
+    used for the merged/paired record's SEQ field, which is always the primary alignment's own
+    SEQ (every merged/paired record is built from `primary_read.copy()`). The primary/'main'
+    segment is *by construction* forward in that frame: its own SEQ+CIGAR are already
+    self-consistent in the standard SAM sense (CIGAR walks the reference forward against SEQ as
+    stored), independent of whatever strand minimap2 happened to report for the whole read during
+    the initial, single-alignment search against the original as-sequenced query -- that
+    absolute flag describes a relationship (original read vs. reference) that stops being
+    relevant once `primary_read`'s own SEQ becomes the shared frame everything else is expressed
+    in. Every other (independently re-aligned rescue) segment's own reported flag, by contrast,
+    *is* already relative to that same shared frame, since its own minimap2 call queried a literal
+    substring of the primary's SEQ -- so it's used as-is, unadjusted.
+
+    Without this distinction, a read that simply happened to be *sequenced* from the reference's
+    reverse strand (routine, strand-agnostic long-read sequencing -- unrelated to any real event)
+    would show a spurious strand mismatch between its primary segment and every rescued segment,
+    incorrectly splitting them into separate paired records and/or flipping the Donor/Acceptor
+    junction side used for position calculation, corrupting otherwise-ordinary non-inversion
+    events. (Confirmed empirically: an ordinary cisins read whose whole-read primary alignment
+    was minimap2 flag=16 had its Acceptor site jump from the correct position to a bogus one
+    ~3.3kb away -- exactly the primary segment's own reference span -- once naively given its own
+    absolute flag instead of being treated as the frame's forward anchor.)
+    """
+    if segment.get('type') == 'main':
+        return 0
+    return int(segment['read'][1]) & 16
+
+
 def group_contiguous_segments(segments):
     """Group segments that can be merged with N gaps based on genomic positions"""
     if not segments:
         return []
-    
+
     contiguous_groups = []
     current_group = [segments[0]]
-    
+
     for i in range(1, len(segments)):
         curr_seg = segments[i-1]
         next_seg = segments[i]
-        
+
         # Calculate genomic end position of current segment
         curr_end_pos = calculate_genomic_end_position(curr_seg['ref_pos'], curr_seg['cigar'])
-        
-        # Check merging criteria: same reference + no overlap
+
+        # Check merging criteria: same reference + no overlap + same strand. A single SAM
+        # record has one strand for its entire extent, so segments on different strands (e.g.
+        # either side of an inversion boundary) can never be merged into one N-gapped record --
+        # they must become separate paired records instead, which each carry their own strand.
         can_merge = (
             curr_seg['ref_name'] == next_seg['ref_name'] and  # Same reference sequence
-            curr_end_pos < next_seg['ref_pos']  # No overlap (genomically contiguous)
+            curr_end_pos < next_seg['ref_pos'] and  # No overlap (genomically contiguous)
+            _segment_strand(curr_seg) == _segment_strand(next_seg)  # Same strand
         )
-        
+
         if can_merge:
             current_group.append(next_seg)
         else:
             contiguous_groups.append(current_group)
             current_group = [next_seg]
-    
+
     contiguous_groups.append(current_group)
     return contiguous_groups
 
 def create_single_merged_record_new(base_read_name, primary_read, segments):
     """Create single merged record with N gaps for contiguous segments, using SAM-based accounting"""
     import re
-    
+
     # Build hierarchical accounting map based on actual SAM file data
     segment_accounting = build_hierarchical_accounting_map(base_read_name, segments)
-    
+
     # Build merged CIGAR by processing segments in sequence order
     merged_cigar_parts = []
     merged_ref_pos = segments[0]['ref_pos']
     merged_ref_name = segments[0]['ref_name']
-    
+
     for i, segment in enumerate(segments):
         is_first_segment = (i == 0)
         is_last_segment = (i == len(segments) - 1)
-        
+
         # Get accounting info for this specific segment
         segment_read_name = segment['read'][0]
         accounted_positions = segment_accounting.get(segment_read_name, set())
-        
+
         if i == 0:
             # First segment
             aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, is_first_segment, is_last_segment)
@@ -1002,27 +1040,30 @@ def create_single_merged_record_new(base_read_name, primary_read, segments):
             gap_size = segment['ref_pos'] - last_end_pos - 1
             if gap_size > 0:
                 merged_cigar_parts.append(f"{gap_size}N")
-            
+
             # Add segment's aligned portion
             aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, is_first_segment, is_last_segment)
             merged_cigar_parts.extend(aligned_ops)
             last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
-    
+
     # Create merged record
     merged_read = primary_read.copy()
     merged_read[0] = base_read_name
-    merged_read[1] = '0'  # Primary alignment
+    # Primary alignment, strand preserved -- group_contiguous_segments only ever groups
+    # same-strand segments together, so any segment's strand bit is the whole group's strand
+    # (previously hard-coded to '0'/forward regardless of true strand).
+    merged_read[1] = str(_segment_strand(segments[0]))
     merged_read[2] = merged_ref_name
     merged_read[3] = str(merged_ref_pos)
     merged_read[4] = '255'  # High MAPQ
     merged_read[5] = ''.join(merged_cigar_parts)
-    
+
     # Keep essential tags
     essential_tags = []
     for field in primary_read[11:]:
         if field.startswith(('NM:', 'FI:', 'TC:')) and not field.startswith('SA:'):
             essential_tags.append(field)
-    
+
     return merged_read[:11] + essential_tags
 
 def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_first_segment=False, is_last_segment=False):
@@ -1030,17 +1071,17 @@ def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_firs
     import re
     cigar_ops = re.findall(r'(\d+)([MIDNSHPX=])', cigar)
     aligned_ops = []
-    
+
     # Find main alignment position to determine softclip positions
     main_alignment_idx = None
     for i, (length, op) in enumerate(cigar_ops):
         if op in 'MI=X':
             main_alignment_idx = i
             break
-    
+
     if accounted_softclip_positions is None:
         accounted_softclip_positions = set()
-    
+
     for i, (length, op) in enumerate(cigar_ops):
         if op in 'M=X':
             aligned_ops.append(f"{length}M")  # Normalize to M
@@ -1056,19 +1097,19 @@ def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_firs
                     position_scalar = 0.4  # Before main alignment (softclip_0 position)
                 else:
                     position_scalar = 0.6  # After main alignment (softclip_1 position)
-                
+
                 # Only process softclips that are NOT accounted for by softclip alignments
                 if position_scalar not in accounted_softclip_positions:
                     # Determine if this is a global edge or internal softclip
                     is_global_edge = False
-                    
+
                     if i == 0 and is_first_segment:
                         # Beginning of first segment in global sequence
                         is_global_edge = True
                     elif i == len(cigar_ops) - 1 and is_last_segment:
                         # End of last segment in global sequence
                         is_global_edge = True
-                    
+
                     if is_global_edge:
                         # Global edge softclip - preserve as softclip
                         aligned_ops.append(f"{length}S")
@@ -1076,37 +1117,37 @@ def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_firs
                         # Internal softclip - convert to insertion
                         aligned_ops.append(f"{length}I")
                 # If softclip is accounted for by a softclip alignment, skip it completely
-    
+
     return aligned_ops
 
 def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
     """Create paired records from multiple contiguous groups using SAM-based accounting"""
     records = []
-    
+
     # Build hierarchical accounting map based on actual SAM file data
     all_segments = []
     for group in contiguous_groups:
         all_segments.extend(group)
     segment_accounting = build_hierarchical_accounting_map(base_read_name, all_segments)
-    
+
     # Pre-process all groups to get their final CIGAR operations
     processed_groups = []
-    
+
     for group_idx, group in enumerate(contiguous_groups):
         # Build CIGAR for this group
         group_cigar_parts = []
         group_ref_pos = group[0]['ref_pos']
         group_ref_name = group[0]['ref_name']
-        
+
         for seg_idx, segment in enumerate(group):
             # Determine global position: first segment overall and last segment overall
             global_first = (group_idx == 0 and seg_idx == 0)
             global_last = (group_idx == len(contiguous_groups) - 1 and seg_idx == len(group) - 1)
-            
+
             # Get accounting info for this specific segment
             segment_read_name = segment['read'][0]
             accounted_positions = segment_accounting.get(segment_read_name, set())
-            
+
             if seg_idx == 0:
                 # First segment in group
                 aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, global_first, global_last)
@@ -1117,61 +1158,64 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
                 gap_size = segment['ref_pos'] - last_end_pos - 1
                 if gap_size > 0:
                     group_cigar_parts.append(f"{gap_size}N")
-                
+
                 # Add segment's aligned portion
                 aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, global_first, global_last)
                 group_cigar_parts.extend(aligned_ops)
                 last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
-        
-        # Store processed group information
+
+        # Store processed group information (strand from the group's own segments -- all
+        # segments within one group share a strand, enforced by group_contiguous_segments)
         processed_groups.append({
             'cigar_parts': group_cigar_parts,
             'ref_pos': group_ref_pos,
-            'ref_name': group_ref_name
+            'ref_name': group_ref_name,
+            'strand': _segment_strand(group[0]),
         })
-    
+
     # Now build records with correct hard clips calculated from processed operations
     for group_idx, processed_group in enumerate(processed_groups):
         # Calculate directional hard clip sizes from processed CIGAR operations
         preceding_groups_length = 0
         following_groups_length = 0
-        
+
         # Calculate length of groups that come before this one (for beginning hard clip)
         for idx in range(group_idx):
             processed_cigar = ''.join(processed_groups[idx]['cigar_parts'])
             # Calculate query-consuming operations from processed CIGAR
             preceding_groups_length += sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', processed_cigar))
-        
+
         # Calculate length of groups that come after this one (for end hard clip)
         for idx in range(group_idx + 1, len(processed_groups)):
             processed_cigar = ''.join(processed_groups[idx]['cigar_parts'])
             # Calculate query-consuming operations from processed CIGAR
             following_groups_length += sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', processed_cigar))
-        
-        # Create record for this group
+
+        # Create record for this group: primary vs supplementary bit, strand preserved from
+        # the group's own segments (previously hard-coded to forward regardless of true strand).
         record = primary_read.copy()
         record[0] = base_read_name
-        record[1] = '0' if group_idx == 0 else '2048'  # Primary vs supplementary
+        record[1] = str((0 if group_idx == 0 else 2048) | processed_group['strand'])
         record[2] = processed_group['ref_name']
         record[3] = str(processed_group['ref_pos'])
         record[4] = '255'
-        
+
         # Build CIGAR with directional hard clips
         cigar_parts = []
-        
+
         # Add beginning hard clip if there are preceding groups
         if preceding_groups_length > 0:
             cigar_parts.append(f"{preceding_groups_length}H")
-        
+
         # Add the main CIGAR for this group
         cigar_parts.extend(processed_group['cigar_parts'])
-        
+
         # Add end hard clip if there are following groups
         if following_groups_length > 0:
             cigar_parts.append(f"{following_groups_length}H")
-        
+
         record[5] = ''.join(cigar_parts)
-        
+
         # Set mate information for paired records
         if len(processed_groups) > 1:
             if group_idx == 0:
@@ -1184,36 +1228,36 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
                 record[6] = '*'
                 record[7] = '0'
                 record[8] = '0'
-        
+
         # Add tags
         fi_value = group_idx + 1
         tc_value = len(processed_groups)
         tags = [f'FI:i:{fi_value}', 'NM:i:0', f'TC:i:{tc_value}']
-        
+
         records.append(record[:11] + tags)
-    
+
     return records
 
 def get_mapped_softclip_positions(base_read_name, sam_file='output.sam'):
     """Parse intermediate SAM file to determine which nested softclip read names are actually mapped"""
     mapped_read_names = set()
-    
+
     with open(sam_file, 'r') as f:
         for line in f:
             if line.startswith('@'):
                 continue
-            
+
             fields = line.strip().split('\t')
             read_name = fields[0]
             flag = int(fields[1])
-            
+
             # Check if this is a nested softclip read for our base read
             if read_name.startswith(base_read_name + '_softclip_'):
                 # Check if it's mapped (flag bit 4 not set)
                 if not (flag & 4):
                     # Store the full mapped read name
                     mapped_read_names.add(read_name)
-    
+
     return mapped_read_names
 
 
@@ -1223,27 +1267,27 @@ _softclip_cache = None
 def get_mapped_softclip_positions_cached(base_read_name, sam_file='output.sam'):
     """Python cached version of get_mapped_softclip_positions - reads file once and caches all results"""
     global _softclip_cache
-    
+
     # Check if cache exists
     if _softclip_cache is not None:
         return _softclip_cache.get(base_read_name, set())
-    
+
     # Build cache - read file once
     print("Building softclip cache from SAM file (Python)...")
     _softclip_cache = {}
-    
+
     with open(sam_file, 'r') as f:
         for line in f:
             if line.startswith('@'):
                 continue
-            
+
             fields = line.strip().split('\t')
             if len(fields) < 2:
                 continue
-                
+
             read_name = fields[0]
             flag = int(fields[1])
-            
+
             # Check if this is a softclip read
             if '_softclip_' in read_name:
                 # Extract base read name
@@ -1253,7 +1297,7 @@ def get_mapped_softclip_positions_cached(base_read_name, sam_file='output.sam'):
                     if base_name not in _softclip_cache:
                         _softclip_cache[base_name] = set()
                     _softclip_cache[base_name].add(read_name)
-    
+
     print(f"Softclip cache built with {len(_softclip_cache)} base reads (Python)")
     return _softclip_cache.get(base_read_name, set())
 
@@ -1269,30 +1313,30 @@ def update_hardclipped_values(read):
     Modifies read[9] (sequence) and read[10] (quality scores) to contain only the portions corresponding to the non-hardclipped regions.
     """
     import re
-    
+
     sequence = read[9]
     quality_scores = read[10]
     cigar = read[5]
-    
+
     # Check if there are hardclips in the CIGAR string
     if 'H' not in cigar:
         return  # No hardclips, nothing to do
-    
+
     # Parse CIGAR operations
     cigar_ops = re.findall(r'(\d+)([MIDNSHPX=])', cigar)
-    
+
     # Calculate how many nucleotides to remove from the start and end
     start_hardclip = 0
     end_hardclip = 0
-    
+
     # Check for hardclip at the beginning
     if cigar_ops and cigar_ops[0][1] == 'H':
         start_hardclip = int(cigar_ops[0][0])
-    
+
     # Check for hardclip at the end
     if cigar_ops and cigar_ops[-1][1] == 'H':
         end_hardclip = int(cigar_ops[-1][0])
-    
+
     # Remove hardclipped regions from both sequence and quality scores
     if start_hardclip > 0 or end_hardclip > 0:
         if end_hardclip > 0:
@@ -1303,7 +1347,7 @@ def update_hardclipped_values(read):
             # Remove only from the start
             updated_sequence = sequence[start_hardclip:]
             updated_quality = quality_scores[start_hardclip:]
-        
+
         # Update both sequence and quality scores in the read
         read[9] = updated_sequence
         read[10] = updated_quality
@@ -1312,25 +1356,25 @@ def build_hierarchical_accounting_map(base_read_name, segments, sam_file='output
     """Build accounting map that considers the hierarchical softclip structure"""
     # Get all mapped softclip read names from SAM file - use cached version
     mapped_read_names = get_mapped_softclip_positions_cached(base_read_name, sam_file)
-    
+
     # Build accounting map for each segment based on which nested softclips are mapped
     segment_accounting = {}
-    
+
     for segment in segments:
         segment_read_name = segment['read'][0]  # Get the read name from the segment
         segment_accounting[segment_read_name] = set()
-        
+
         if segment['type'] == 'main':
             # For main alignment, check if direct softclip reads are mapped
             # If base_softclip_0 or base_softclip_1 are mapped, account for those positions
             direct_softclip_0 = f"{base_read_name}_softclip_0"
             direct_softclip_1 = f"{base_read_name}_softclip_1"
-            
+
             if direct_softclip_0 in mapped_read_names:
                 segment_accounting[segment_read_name].add(0.4)  # softclip_0 position
             if direct_softclip_1 in mapped_read_names:
                 segment_accounting[segment_read_name].add(0.6)  # softclip_1 position
-        
+
         elif segment['type'] == 'softclip':
             # For softclip segments, check if nested softclips from this segment are mapped
             # If they are, then we need to account for the corresponding positions
@@ -1343,9 +1387,9 @@ def build_hierarchical_accounting_map(base_read_name, segments, sam_file='output
                         # This is a softclip_0 from the current segment, so position 0 is accounted for
                         segment_accounting[segment_read_name].add(0.4)
                     elif nested_suffix.startswith('_softclip_1'):
-                        # This is a softclip_1 from the current segment, so position 1 is accounted for  
+                        # This is a softclip_1 from the current segment, so position 1 is accounted for
                         segment_accounting[segment_read_name].add(0.6)
-    
+
     return segment_accounting
 
 
@@ -1489,7 +1533,7 @@ def merge_split_alignments(base_read_name, reads):
                 softclip_reads.setdefault(sequence_position, []).append(read)
         elif not (flag & 4) and not (flag & 2048):  # Primary alignment candidate
             primary_candidates.append(read)
-    
+
     # Select primary read with highest AS score
     if primary_candidates:
         primary_read = max(primary_candidates, key=get_as_score_from_read_fields)
@@ -1499,7 +1543,7 @@ def merge_split_alignments(base_read_name, reads):
 
     # Step 2: Create segments for sequence ordering
     segments = []
-    
+
     # Add main alignment segment
     main_ref_pos = int(primary_read[3])
     main_ref_name = primary_read[2]
@@ -1512,7 +1556,7 @@ def merge_split_alignments(base_read_name, reads):
         'read': primary_read,
         'cigar': primary_read[5]
     })
-    
+
     # Add softclip segments. Usually exactly one read per position, but when
     # rewrite_embedded_insertions_as_softclips exposes a genuine two-locus junction, this
     # identifier's own realignment can itself split into primary+supplementary -- both must be
@@ -1556,7 +1600,7 @@ def merge_split_alignments(base_read_name, reads):
                 'ref_pos': int(best[3]), 'ref_name': best[2], 'seq_pos': seq_pos,
                 'type': 'softclip', 'read': best, 'cigar': best[5]
             })
-    
+
     # Step 2b: Drop softclip segments that are near-duplicates of another segment already
     # present -- can happen when a nested softclip-of-a-softclip independently rediscovers
     # essentially the same locus that its own parent's supplementary alignment already found
@@ -1566,10 +1610,10 @@ def merge_split_alignments(base_read_name, reads):
 
     # Step 3: Sequence ordering - sort by sequence position
     segments.sort(key=lambda x: x['seq_pos'])
-    
+
     # Step 4: Genomic merging - group contiguous segments
     contiguous_groups = group_contiguous_segments(segments)
-    
+
     # Step 5: Output generation
     if len(contiguous_groups) == 1:
         # Single merged record
@@ -1577,6 +1621,3 @@ def merge_split_alignments(base_read_name, reads):
     else:
         # Paired records
         return create_paired_records_new(base_read_name, primary_read, contiguous_groups)
-
-
-

@@ -15,6 +15,22 @@ This document describes the detailed logic for merging softclip alignments with 
 - `read_softclip_1_softclip_0`: Softclip derived from the **beginning** of the `read_softclip_1` alignment
 - `read_softclip_0_softclip_1_softclip_0`: Further nesting (beginning of the `read_softclip_0_softclip_1` alignment)
 
+### Insertion/Rest Split Suffix (`_ins`)
+When a softclip originates from `rewrite_embedded_insertions_as_softclips` (an embedded large
+`I` CIGAR op rewritten into a trailing softclip -- see algorithm_description.txt), it is realigned
+as **two** independent candidates instead of one glued fragment:
+- `read_softclip_1`: everything *after* the embedded insertion (unchanged name/identifier).
+- `read_softclip_1_ins`: the insertion content *alone*.
+
+The `_ins` suffix only affects two things, deliberately: (1) `merge_temp_sam_to_output`'s
+AS-based "best primary" selection treats it as a **separate identifier** from its sibling (so
+neither is discarded there -- both must survive to the merge step below), and (2)
+`_dedupe_redundant_segments` (see "Overlap Detection" below) never treats it as a duplicate of
+its sibling even though the two are expected to overlap heavily in reference space by design.
+Position-in-sequence calculation (`calculate_sequence_position`) ignores the suffix entirely --
+`softclip_1` and `softclip_1_ins` land at the *same* fractional position, which is what causes
+them to be paired together at the merge step.
+
 ### Position Interpretation
 - All `softclip_0` paths (regardless of nesting) are **before** the main alignment in sequence order
 - All `softclip_1` paths (regardless of nesting) are **after** the main alignment in sequence order
@@ -166,7 +182,33 @@ Segments must be split into paired records if:
 1. For each read in the read group:
    - If it's a softclip read (`_softclip_` in name): calculate numerical sequence position
    - If it's the main alignment: assign position 0.5
-   - Select best alignment by AS score if multiple alignments exist for same position
+   - **Two candidates at the same position**: if a softclip identifier's own realignment splits
+     into primary+supplementary (a genuine two-locus junction exposed by
+     rewrite_embedded_insertions_as_softclips), or if it's an insertion/rest split pair (see
+     `_ins` suffix above), BOTH are kept as separate segments -- not collapsed to a single
+     "best" one, which would silently discard a real segment. They are ordered and their
+     touching edges converted to hard clips (`_true_query_start` / `_clip_side_to_hardclip`) so
+     `extract_aligned_operations` doesn't double-count the shared boundary. For a natural
+     primary+supplementary pair, order is inferred from each record's own softclip amount
+     relative to the original read; for an `_ins`/rest pair, order is known *a priori* by
+     construction (the insertion always precedes its rest sibling) rather than inferred, since
+     the two were aligned independently as disjoint substrings and their own clip amounts don't
+     reflect position in a shared parent frame the way a natural split's do.
+   - **Three or more candidates at the same position**: falls back to the original single-best-AS
+     behavior (this combination hasn't been observed/verified beyond two).
+
+### Step 1b: Redundant-Segment Dedup
+Before sorting, drop softclip segments that substantially overlap another segment already kept
+on the same reference (>50% reciprocal overlap of the smaller segment's reference span), keeping
+whichever has more aligned query bases. This handles cases like a nested softclip-of-a-softclip
+independently rediscovering essentially the same locus its own parent's supplementary already
+found (they arrive via different softclip identifiers, so nothing earlier catches this).
+**Never fires between the two halves of an `_ins`/rest split pair** -- those are deliberately
+complementary, not competing duplicates, even though they're expected to overlap heavily in
+reference space (an early attempt at this dedup logic didn't have this exemption and silently
+undid the insertion/rest split for every case where the split actually mattered, since the
+longer "rest" side accumulates more aligned query bases in aggregate regardless of whether its
+placement in the disputed region is correct).
 
 ### Step 2: Sequence Ordering
 1. Sort all segments by their numerical positions (float values)
@@ -183,8 +225,13 @@ Segments must be split into paired records if:
 2. If segments must be split: create paired records with appropriate hard clips
 
 ### Step 5: AS Score Selection
-- When multiple alignments map to the same sequence position, select the one with the highest AS (alignment score)
-- This handles supplementary alignments for the same softclip automatically during read collection
+- When multiple *competing* alignments exist for the same softclip identifier (true alternatives,
+  not a genuine primary+supplementary/insertion+rest pair -- see Step 1 above), select the one
+  with the highest AS (alignment score) as that identifier's best primary; any supplementary
+  companions for the same identifier are kept alongside it, not discarded.
+- Selecting the base read's own main alignment among multiple primary-like candidates (e.g. ONT/
+  PacBio's highest-AS softclip selection, vs. short-read's first-record selection) works the same
+  way, one level up.
 
 ## Key Considerations
 

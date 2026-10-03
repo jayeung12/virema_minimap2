@@ -1,15 +1,15 @@
-##      Copyright (c) 2013-2024 Andrew Laurence Routh
-##      
+##      Copyright (c) 2013-2026 Andrew Laurence Routh
+##
 ##      Permission is hereby granted, free of charge, to any person obtaining a copy
 ##      of this software and associated documentation files (the "Software"), to deal
 ##      in the Software without restriction, including without limitation the rights
 ##      to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 ##      copies of the Software, and to permit persons to whom the Software is
 ##      furnished to do so, subject to the following conditions:
-##      
+##
 ##      The above copyright notice and this permission notice shall be included in
 ##      all copies or substantial portions of the Software.
-##      
+##
 ##      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 ##      IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 ##      FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -35,9 +35,9 @@ start = time.time()
 
 ##      ------------------------------------------------------------------------------------------------------------
 ##      Compound_Handling_Script will determine whether trimmed nucleotides found between recombination
-##      sites are present between the donor and accpetor sites for these two recombination events.
+##      sites are present between the donor and acceptor sites for these two recombination events.
 ##      If so, they are assumed to have arisen due to multiple recombination events occuring within close proximity.
-##      This is only a good assumption in viral genomes (where the number if possible matches is low) and
+##      This is only a good assumption in viral genomes (where the number of possible matches is low) and
 ##      when there are sufficient nucleotides in the trimmed sequence. This number is set at the command line
 ##      wih the option: --Compound_Handling.  A default value of 10 is recommended.  This value must be
 ##      larger than the MicroInDel number.
@@ -61,8 +61,8 @@ def Compound_Handling_Script(Donor, DonorSite, Insertion, AcceptorSite, uDelDict
                         AddToDict(Donor, Donor, NewAcceptorSite, DonorSite, uDelDicts, ReadName)
                 else:
                         AddToDict(Donor, Donor, NewAcceptorSite, DonorSite, RecDicts, ReadName)
-                NewDonorSite = str(int(Hits[0]) + int(DonorSite) + len(Insertion) + 1) 
-                if int(AcceptorSite) - int(NewDonorSite) - 1 <= cfg.MicroInDel_Length:              
+                NewDonorSite = str(int(Hits[0]) + int(DonorSite) + len(Insertion) + 1)
+                if int(AcceptorSite) - int(NewDonorSite) - 1 <= cfg.MicroInDel_Length:
                         AddToDict(Donor, Donor, AcceptorSite, NewDonorSite, uDelDicts, ReadName)
                 else:
                         AddToDict(Donor, Donor, AcceptorSite, NewDonorSite, RecDicts, ReadName)
@@ -73,15 +73,15 @@ def Compound_Handling_Script(Donor, DonorSite, Insertion, AcceptorSite, uDelDict
                         AddToDict(Donor, Donor, DonorSite, NewAcceptorSite, uDelDicts, ReadName)
                 else:
                         AddToDict(Donor, Donor, DonorSite, NewAcceptorSite, RecDicts, ReadName)
-                NewDonorSite = str(int(Hits[0]) + int(DonorSite) + len(Insertion) + 1) 
-                if int(AcceptorSite) - int(NewDonorSite) - 1 <= cfg.MicroInDel_Length:              
+                NewDonorSite = str(int(Hits[0]) + int(DonorSite) + len(Insertion) + 1)
+                if int(AcceptorSite) - int(NewDonorSite) - 1 <= cfg.MicroInDel_Length:
                         AddToDict(Donor, Donor, NewDonorSite, AcceptorSite, uDelDicts, ReadName)
                 else:
                         AddToDict(Donor, Donor, NewDonorSite, AcceptorSite, RecDicts, ReadName)
             return "HIT"
-                
+
 ##      ----------------------------------------------------------------------------------------------------------
-##      UniquifyReport() removes identical results.  Reads giving identical results may be PCR duplicates.  
+##      UniquifyReport() removes identical results.  Reads giving identical results may be PCR duplicates.
 ##      Similarly, finding unique multiple unique reads over single recombination junctions validates recombinant
 ##      ----------------------------------------------------------------------------------------------------------
 
@@ -98,7 +98,7 @@ def UniquifyReport(FileIn, FileOut):
         OPEN = gzip.open(cfg.FileIn,'rt')
     else:
         OPEN = open(cfg.FileIn,'r')
-    with OPEN as InputData:  
+    with OPEN as InputData:
         line = InputData.readline()
         while line:
             if line[:3] in SamHeaders:
@@ -118,7 +118,7 @@ def UniquifyReport(FileIn, FileOut):
                 if UniqueData not in TempSet:
                     DeDupedData.write(line)
                     m+=1
-                    TempSet.add(UniqueData) 
+                    TempSet.add(UniqueData)
             line = InputData.readline()
     DeDupedData.close()
     print("Total of %s reads/segments in original dataset" % n)
@@ -126,7 +126,7 @@ def UniquifyReport(FileIn, FileOut):
 
 ##      ----------------------------------------------------------------------------------------
 ##      Function BedGraph_Plot() will find regions deleted or duplicated due to recombination and return
-##      a string string of frequencies and nucleotide positions. 
+##      a string string of frequencies and nucleotide positions.
 ##      ----------------------------------------------------------------------------------------
 
 def BEDGraph_Plot():
@@ -184,7 +184,7 @@ def BEDGraph_Plot():
                     n+=1
                 OutputFile.write('\t'.join([str(k) for k in lastline]) + '\n')
         OutputFile.close()
-                            
+
 ##      ----------------------------------------------------------------------------------------
 ##      Function Rev_Comp() will return the Reverse Complement of a given DNA string
 ##      ----------------------------------------------------------------------------------------
@@ -199,7 +199,7 @@ def Rev_Comp(Seq):
 ##      ----------------------------------------------------------------------------------------------------
 ##      Indices will find the locations of pertinent information in the results file as directed by the Code
 ##      ----------------------------------------------------------------------------------------------------
-    
+
 def Indices(List):
     n = 1
     Ms = []
@@ -220,7 +220,7 @@ def safe_extract_position(line, base_index, expected_offset, is_donor=False):
     """
     start_search = base_index + expected_offset
     max_search = min(len(line), start_search + 5)  # Search a few positions ahead
-    
+
     for i in range(start_search, max_search):
         if i < len(line) and "_" in line[i]:
             # This looks like position information (contains underscore)
@@ -254,7 +254,7 @@ def safe_extract_position(line, base_index, expected_offset, is_donor=False):
         elif i < len(line) and line[i].isdigit():
             # Direct numeric position
             return line[i]
-    
+
     # If no valid position found, return the original attempt
     if start_search < len(line):
         if is_donor:
@@ -353,7 +353,7 @@ def FindCoveragefromBED(SAMFILEROOT):
                 if Ref in cfg.RefsLib1:
                     cfg.RefsLib1_Coverage[Ref + '_RevStrand'][int(Coord)] = int(Count)
                     line = InCov.readline().rstrip()
-                
+
 ##      -------------------------------------------------------------------------------------------------------
 ##      ExtractRefDataBWA() will find the names of the genes used in the virus or host genome references.
 ##      Input is typical FASTA file, as per the BWA command line.
@@ -383,7 +383,7 @@ def ExtractRefDataBWA():
                 for line in FASTAIN:
                     if line[0] == '>':
                         Name = line.split()[0][1:]
-                        Name = Name.rstrip()                        
+                        Name = Name.rstrip()
                         cfg.RefsLib2.add(Name)
                         cfg.RefsLib2.add(Name + "_RevStrand")
                         print(Name)
@@ -399,7 +399,7 @@ def ExtractRefDataBWA():
         #     cfg.Genes[Name + "_RevStrand"] = Rev_Comp(cfg.Genes[Name])
         print("Finished extracting gene data")
         return cfg.RefsLib1, cfg.RefsLib2, cfg.Genes
-    
+
 ##      -------------------------------------------------------------------------------------------
 ##      AddToDict() takes the Donor and Acceptor sites and references for a given recombination event,
 ##      and collates them into a Dictionary which will later be written to a results file.
@@ -436,8 +436,8 @@ def AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, Dict, ReadName):
                                         Fuzz = RightFuzz - LeftFuzz
                                     else:
                                         Fuzz = LeftFuzz - RightFuzz
-                                    ## Use of // forces odd-length Fuzz to 3' end whether Fwd or Rev strand 
-                                    DonorSite = str(int(DonorSite) - (int(Fuzz//2))) 
+                                    ## Use of // forces odd-length Fuzz to 3' end whether Fwd or Rev strand
+                                    DonorSite = str(int(DonorSite) - (int(Fuzz//2)))
                                     AcceptorSite = str(int(AcceptorSite) - (int(Fuzz//2)))
                                 elif cfg.Defuzz == 'Left':
                                         DonorSite = str(int(DonorSite) - RightFuzz)
@@ -564,7 +564,7 @@ def ContractX(x):
 
 ##      -----------------------------------------------------------------------
 ##      RecreateOldFormatfromSAM() Turns information from a SAM file into form
-##      originally used in ViReMa to compile recombination results. 
+##      originally used in ViReMa to compile recombination results.
 ##      -----------------------------------------------------------------------
 
 def RecreateOldFormatfromSAM(lines):
@@ -604,10 +604,8 @@ def RecreateOldFormatfromSAM(lines):
                     else:
                         Code += (CIGAR[:1]) + ['X']
                     CIGAR = CIGAR[2:]
-                elif CIGAR[1] == 'M' and cfg.ScrutSAM and LenMapped <= cfg.Seed and len(CIGAR) > 2: 
+                elif CIGAR[1] == 'M' and cfg.ScrutSAM and LenMapped <= cfg.Seed and len(CIGAR) > 2:
                     if CIGAR[3] == 'N':
-                        ## First Mapped Segment before Rec and was shorter than seed allowed in ViReMa 
-                        ## (probably due to non-virema mapper)
                         line.append(Read[:int(CIGAR[0])])
                         Read = Read[int(CIGAR[0]):]
                         if Code and Code[-1] == 'X':
@@ -623,9 +621,7 @@ def RecreateOldFormatfromSAM(lines):
                 while CIGAR:
                     if CIGAR[1] == 'M':
                         LenMapped = int(CIGAR[0])
-                        if cfg.ScrutSAM and LenMapped <= cfg.Seed and PrevRec == True and len(CIGAR) < 3: 
-                            ## Last Mapped Segment was shorter than seed allowed in ViReMa 
-                            ## (probably due to non-virema mapper)
+                        if cfg.ScrutSAM and LenMapped <= cfg.Seed and PrevRec == True and len(CIGAR) < 3:
                             Xs = Read[:int(CIGAR[0])]
                             Read = Read[int(CIGAR[0]):]
                             Code += (CIGAR[:1]) + ['X']
@@ -640,7 +636,7 @@ def RecreateOldFormatfromSAM(lines):
                             Code += CIGAR[:2]
                             CurrentNt += int(CIGAR[0])
                             CIGAR = CIGAR[2:]
-                            PrevRec = False                            
+                            PrevRec = False
                     elif CIGAR[1] == 'X' or CIGAR[1] == 'S':
                         Xs = Read[:int(CIGAR[0])]
                         Read = Read[int(CIGAR[0]):]
@@ -694,7 +690,7 @@ def RecreateOldFormatfromSAM(lines):
                         line.insert(0, Seg[2].split()[0] + '_RevStrand')
                         Read = Read[int(CIGAR[0]):]
                         Code = CIGAR[:2] + Code
-                        CurrentNt += int(CIGAR[0])   
+                        CurrentNt += int(CIGAR[0])
                         CIGAR = CIGAR[2:]
                     elif CIGAR[1] == 'X' or CIGAR[1] == 'S':
                         Xs = Read[:int(CIGAR[0])]
@@ -720,35 +716,8 @@ def RecreateOldFormatfromSAM(lines):
     Totalline.append(TotalCode)
     return Totalline
 
-# def ReverseEvents(line, Entries):
-#     newline = []
-#     newline.append(line[0])
-#     x = line[1:]
-#     for i in range(int(Entries/3))[::-1]:
-#         name = x[i*3]
-#         name = ''.join(name.split('_RevStrand'))
-#         newline.append(name)
-#         y = x[i*3+1]
-#         if "_" in y:
-#             if '_to_' in y:
-#                 y = y.split("_")
-#                 y = y[::-1]
-#                 y = "_".join(y)
-#             else:
-#                 y = y.split("_")
-#                 y = y[::-1]
-#                 y[1] = Rev_Comp(y[1])
-#                 y = "_".join(y)
-#             newline.append(y)
-#             newline.append(x[i*3+2])
-#         else:
-#             z = x[i*3+2]
-#             z = Rev_Comp(z)
-#             y = str(int(y) - len(z) + 1)
-#             newline.append(y)
-#             newline.append(z)
-#     return newline
-        
+
+
 ##      -------------------------------------------------------------------------------------------
 ##      FindCuttingSitesfromCIGAR() will ......
 ##      -------------------------------------------------------------------------------------------
@@ -761,9 +730,9 @@ def FindCuttingSitesfromCIGAR(Cigar, Start, MinSegmentLength, Ref):
     ##60M4I60M insertion:  Count all cutting sites in mapped regions, ignore insertion (cannot count twice)
     ##3S57M80H soft pad and hard pad: Count all cutting sites in mapped regions, ignore pads    n=0
     CIGAR = findall(r"[^\W\d_]+|\d+", Cigar)
-    ##FIND length of read    
+    ##FIND length of read
     #Adds = ['M', 'X', 'S', 'H', 'I']
-    m=0        
+    m=0
     while CIGAR:
         #if CIGAR[1] in Adds:
         m+= int(CIGAR[0])
@@ -774,9 +743,9 @@ def FindCuttingSitesfromCIGAR(Cigar, Start, MinSegmentLength, Ref):
     #Mask[-MinSegmentLength:] = 0
     Sites = np.array([0]*m)
     n=0
-    CIGAR = findall(r"[^\W\d_]+|\d+", Cigar) 
+    CIGAR = findall(r"[^\W\d_]+|\d+", Cigar)
     while CIGAR:
-        if CIGAR[1] == 'M' or CIGAR[1] == 'X' or CIGAR[1] == 'D': #or CIGAR[1] == 'N' 
+        if CIGAR[1] == 'M' or CIGAR[1] == 'X' or CIGAR[1] == 'D': #or CIGAR[1] == 'N'
             ##Add ns
             ##Add cutting sites
             From = Start
@@ -828,7 +797,7 @@ def ResultsSort(File1):
             ##      Sloppy handling of item names is why function is defined within
             ##      another function. Needs Re-write, but works for now.
             ##      ---------------------------------------------------------------
-        
+
             def WritetoBEDFile(Genes, Entry, TargetFile):
                     # Genes is in format: 'Donor_to_Acceptor'
                     # Entry is in format: [DonorSite, 'to', AcceptorSite, '#', Count]
@@ -862,7 +831,7 @@ def ResultsSort(File1):
                             DonorRightSeq = cfg.Genes[Genes[0]][int(Entry[0]):int(Entry[0]) + cfg.Seed]
                         if Genes[1][-10:] == "_RevStrand":
                                 Genes[1] = Genes[1][:-10]
-                                Dir2 = '-'                            
+                                Dir2 = '-'
                                 AcceptorRightSeq = Rev_Comp(cfg.Genes[Genes[1]][int(Entry[2]) - cfg.Seed -1:int(Entry[2]) - 1])
                                 AcceptorLeftSeq = Rev_Comp(cfg.Genes[Genes[1]][int(Entry[2]) - 1:int(Entry[2]) + cfg.Seed - 1])
                                 PseudoRightSeq = Rev_Comp(cfg.Genes[Genes[1]][int(Entry[2]) - cfg.PseudoRef -1:int(Entry[2]) - 1])
@@ -888,7 +857,7 @@ def ResultsSort(File1):
                                 NAME = 'Copy/Snap-Back'
                                 BEDFILE = VirusFusions_BED
                             elif TargetFile in y:
-                                NAME = 'Gene-Fusion' 
+                                NAME = 'Gene-Fusion'
                                 BEDFILE = HostFusions_BED
                             else:
                                 pass
@@ -900,10 +869,10 @@ def ResultsSort(File1):
                         #     pass
                         BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], str(int(Entry[0]) - 1), Entry[0],
                                                                                    Genes[1], Entry[2], str(int(Entry[2]) + 1),
-                                                                                   NAME, Entry[4], Dir1, Dir2, 
+                                                                                   NAME, Entry[4], Dir1, Dir2,
                                                                                    DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                         if cfg.PseudoRef:
-                            PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq 
+                            PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                             BED_OUTPUT += PseudoRef
                         BEDFILE.write(BED_OUTPUT + "\n")
                     else:
@@ -912,7 +881,7 @@ def ResultsSort(File1):
                         try:
                             if not cfg.Stranded and Genes[0][-10:] == "_RevStrand":
                                 LeftCount = str(cfg.RefsLib1_Coverage[Genes[0][:-10]][Start - cfg.Coverage_Offset])
-                                RightCount = str(cfg.RefsLib1_Coverage[Genes[0][:-10]][Stop + cfg.Coverage_Offset])                            
+                                RightCount = str(cfg.RefsLib1_Coverage[Genes[0][:-10]][Stop + cfg.Coverage_Offset])
                             else:
                                 LeftCount = str(cfg.RefsLib1_Coverage[Genes[0]][Start - cfg.Coverage_Offset])
                                 RightCount = str(cfg.RefsLib1_Coverage[Genes[0]][Stop + cfg.Coverage_Offset])
@@ -971,38 +940,38 @@ def ResultsSort(File1):
                                 elif Stop == Start - 1:
                                     NAME = 'Ins:' + Entry[1]
                                 else:
-                                    NAME = 'Back-Splice'                            
+                                    NAME = 'Back-Splice'
                         else:
                             pass
                         #BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                         if TargetFile == VirusRecs:# and Genes[0] == Genes[1]:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
-                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq 
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusRecs_BED.write(BED_OUTPUT + "\n")
                         elif TargetFile == VirusInsertions:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
-                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq 
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusRecs_BED.write(BED_OUTPUT + "\n")
                         elif TargetFile == VirusuIns or TargetFile == VirusuDels:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
-                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq 
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusuRecs_BED.write(BED_OUTPUT + "\n")
                         elif TargetFile == HostRecs:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
-                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq 
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             HostRecs_BED.write(BED_OUTPUT + "\n")
                         elif TargetFile == HostuIns or TargetFile == HostuDels:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
-                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq 
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             HostuRecs_BED.write(BED_OUTPUT + "\n")
                         else:
@@ -1029,7 +998,7 @@ def ResultsSort(File1):
                             elif Libs[0] in cfg.RefsLib2 and Libs[1] in cfg.RefsLib2:
                                     TargetFile = HostuDels
                             else:
-                                    pass                        
+                                    pass
                     elif Mod == 'uIns':
                             if Libs[0] in cfg.RefsLib1:
                                     TargetFile = VirusuIns
@@ -1100,7 +1069,7 @@ def ResultsSort(File1):
                                     TargetFile.write(str(j) + "\t")
                             TargetFile.write("\n@EndofLibrary\n")
 
-        #Dictionaries 
+        #Dictionaries
         InsDicts = {}
         SubDicts = {}
         uDelDicts = {}
@@ -1124,11 +1093,12 @@ def ResultsSort(File1):
         NoiseOnlyCount = 0  # reads with >1 CIGAR segment (fragmented by minor indels) but no gap/event exceeding MicroInDel_Length -- effectively single-locus despite MCount > 1
        # UnknownRecombinations = open(cfg.Output_Dir + cfg.FileTag + "Unknown_Recombinations.txt", "w")
 
-        #Per-read event reconstruction table (long-read workflows only): one row per junction/event,
-        #ordered within each read (segment_index/n_segments), so downstream analysis (e.g. in R) can
-        #group by read_id for the read-level view or filter the table directly for the event-level view.
+        #Introduced with minimap2 integration. Per-read event reconstruction table: one row per junction/event, ordered within each
+        #read (segment_index/n_segments), so downstream analysis (e.g. in R) can group by
+        #read_id for the read-level view or filter the table directly for the event-level view.
         #Not populated for Compound_Handling-resolved events -- out of scope for this table for now.
-        if cfg.LongReadTech:
+
+        if cfg.ReadNamesEntry:
             ReadEventsFile = open(cfg.Output_Dir + cfg.FileTag + "Read_Events.tsv", "w")
             ReadEventsFile.write("read_id\tsegment_index\tn_segments\tevent_type\tchrom1\tpos1\tstrand1\tchrom2\tpos2\tstrand2\tevent_size\n")
         else:
@@ -1183,7 +1153,7 @@ def ResultsSort(File1):
                 else:
                     UMIHalt = False
                 if UMIHalt:
-                    ##Skipping read as is a PCR duplicate. 
+                    ##Skipping read as is a PCR duplicate.
                     wholeline = InRecombs.readline()
                 else:
                     Code = ''.join(findall(r"\D", line[-1]))
@@ -1226,7 +1196,7 @@ def ResultsSort(File1):
                                 # if "RevStrand" in line[i+1]:
                                 #     MappedReadData = cfg.Genes[str(Ref)][int(DonorSite)-1:int(MappingStartPos)]
                                 #     MappedReadData = Rev_Comp(MappedReadData)
-                                # else:   
+                                # else:
                                 #     MappedReadData = cfg.Genes[str(Ref)][int(MappingStartPos)-1:int(DonorSite)]
                                 if Index[0][n+1] == i + 2:
                                         #Recombination Event
@@ -1334,7 +1304,7 @@ def ResultsSort(File1):
                                                         Padcount += 1
                                                 else:
                                                         pass
-                                                    
+
                                             else:
                                                 SubCount += 1
                                                 HasRealEvent = True
@@ -1482,7 +1452,7 @@ def ResultsSort(File1):
                                 pass#UnknownRecombinations.write(wholeline)
                         else:
                                 pass
-                    wholeline = InRecombs.readline()        
+                    wholeline = InRecombs.readline()
         #Output Files for each type of event
         VirusSubstitutions = open(cfg.Output_Dir + cfg.FileTag + "Virus_Substitutions.txt","w")
         VirusInsertions = open(cfg.Output_Dir + cfg.FileTag + "Virus_Insertions.txt","w")
@@ -1514,7 +1484,7 @@ def ResultsSort(File1):
         if cfg.BED:
                 #Create optional BED files.
                 VirusRecs_BED = open(cfg.Output_Dir + 'BED_Files/' + cfg.FileTag + "Virus_Recombination_Results.bed","w")
-                VirusRecs_BED.write('track name=Virus_Recombinations description="Virus_Recombinations" graphType=junctions\n')                
+                VirusRecs_BED.write('track name=Virus_Recombinations description="Virus_Recombinations" graphType=junctions\n')
                 VirusFusions_BED = open(cfg.Output_Dir + 'BED_Files/' + cfg.FileTag + "Virus_Fusions.BEDPE","w")
                 VirusFusions_BED.write('track name=Virus_Fusions description="Virus_Fusions" graphType=BEDPE\n')
                 if cfg.MicroInDel_Length > 0:
@@ -1546,7 +1516,7 @@ def ResultsSort(File1):
                 pass
         WriteFinalDict(InsDicts, 'Ins')
         WriteFinalDict(SubDicts, 'Sub')
-        
+
         ##      Print summary
         print("---------------------------------------------------------------------------------------------------------------------")
         print("Total of %s reads have been analysed:" % Totalcount)
@@ -1633,7 +1603,7 @@ if __name__ == '__main__':
         parser.add_argument("-DeDup", action='store_true', help="Remove potential PCR duplicates. Default is off.")
         parser.add_argument("--UMI", help="Enter string/delimiter used in read name to define UMI barcode. Default is off.")
         parser.add_argument("-ReadNamesEntry", action='store_true', help="Append Read Names contributing to each compiled result. Default is off.")
-        parser.add_argument("-FuzzEntry", action='store_true', help="Append Fuzz present in each recombination result. Default is off.")        
+        parser.add_argument("-FuzzEntry", action='store_true', help="Append Fuzz present in each recombination result. Default is off.")
         parser.add_argument("--Defuzz", help="Choose how to defuzz data:  '5' to report at 5' end of fuzzy region, '3' to report at 3' end, or '0' to report in centre of fuzzy region. Default is no fuzz handling (similar to choosing Right - see Routh et al).")
         parser.add_argument("--MaxFuzz", help="Select maximum allowed length of fuzzy region. Recombination events with longer fuzzy regions will not be reported. Default is Seed Length.")
         parser.add_argument("--MicroInDel_Length", help= "Size of MicroInDels - these are common artifacts of cDNA preparation.  See Routh et al JMB 2012. Default size is 0)")
@@ -1679,7 +1649,7 @@ if __name__ == '__main__':
         else:
             cfg.Debug = False
             cfg.Debug_Func = 'None'
-                                
+
         if not cfg.NoViReMa:
             if args.Header:
                 cfg.HeaderFile = str(args.Header)
@@ -1694,8 +1664,8 @@ if __name__ == '__main__':
             with OPEN as InRecombs:
                     #Find arguments used in Mapping Phase from ViReMa.py
                     line = InRecombs.readline().split()
-                    while line[0] in SamHeaders: 
-                        if line[0] == '@PG':    
+                    while line[0] in SamHeaders:
+                        if line[0] == '@PG':
                             line = line[5:]
                             print(line)
                             #Find arguments used in Mapping Phase from ViReMa.py
@@ -1722,7 +1692,7 @@ if __name__ == '__main__':
         else:
             ##Parameters a re-specified here from a non-ViReMa aligner
             if args.Virus_Index:
-                cfg.Lib1 = str(args.Virus_Index) 
+                cfg.Lib1 = str(args.Virus_Index)
                 #cfg.Genome1 = cfg.Lib1 + '.fa'
             else:
                 print('Error! Virus Index must be specific when using non-ViReMa aligner')
@@ -1731,7 +1701,7 @@ if __name__ == '__main__':
             if args.Host_Index:
                     cfg.Lib2 = str(args.Host_Index)
             else:
-                    cfg.Lib2 = None            
+                    cfg.Lib2 = None
             if args.Seed:
                 cfg.Seed = int(args.Seed)
             else:
@@ -1747,7 +1717,7 @@ if __name__ == '__main__':
                 cfg.Mismatches = int(args.N)
             else:
                 cfg.Mismatches = 1
-        cfg.Lib1 = str(args.Virus_Index) 
+        cfg.Lib1 = str(args.Virus_Index)
         if args.Output_Tag:
                 cfg.FileTag = str(args.Output_Tag)
         else:
@@ -1763,7 +1733,7 @@ if __name__ == '__main__':
         if args.DeDup:
                 cfg.DeDup = True
         else:
-                cfg.DeDup = False        
+                cfg.DeDup = False
         if args.UMI:
                 cfg.UMI = str(args.UMI)
         else:
@@ -1787,7 +1757,7 @@ if __name__ == '__main__':
         if args.PseudoRef:
                 cfg.PseudoRef = int(args.PseudoRef)
         else:
-                cfg.PseudoRef = False                
+                cfg.PseudoRef = False
         if args.Compound_Handling:
                 cfg.Compound_Handling = str(args.Compound_Handling)
         else:
@@ -1800,7 +1770,7 @@ if __name__ == '__main__':
                 cfg.BackSplice_limit = int(args.BackSplice_limit)
         else:
                 cfg.BackSplice_limit = 0
-        cfg.BED = True        
+        cfg.BED = True
         if args.BED12:
                 cfg.BED12 = True
                 if args.Stranded:
@@ -1830,7 +1800,7 @@ if __name__ == '__main__':
         if args.Aligner_Directory:
             if cfg.Windows:
                 cfg.Aligner_Directory = str(args.Aligner_Directory) + '\\'
-            else:                
+            else:
                 cfg.Aligner_Directory = str(args.Aligner_Directory) + '/'
         else:
                 cfg.Aligner_Directory = ''

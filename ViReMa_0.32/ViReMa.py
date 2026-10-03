@@ -1,4 +1,4 @@
-##      Copyright (c) 2013-2024 Andrew Laurence Routh
+##      Copyright (c) 2013-2026 Andrew Laurence Routh
 ##
 ##      Permission is hereby granted, free of charge, to any person obtaining a copy
 ##      of this software and associated documentation files (the "Software"), to deal
@@ -53,20 +53,20 @@ def MainArgs():
         Alignment_group = parser.add_argument_group("Alignment Options", "Set alignment conditions")
         Compilation_group = parser.add_argument_group("Compilation Options", "Set some compilation options and extra output files")
 
-        ##Required Options        
+        ##Required Options
         parser.add_argument("-Windows", action='store_true', help= "Select this option if running ViReMa from a Windows/Cygwin shell (removes memory mapping in bowtie stages).")
         parser.add_argument("Virus_Index", help="Virus reference genome in FASTA format. ViReMa will call bowtie to generate index. e.g. FHV_Genome.fasta")
         parser.add_argument("Input_Data", help= "File containing single reads in FASTQ format")
         parser.add_argument("-Fasta", action='store_true', help="Select if raw data is in FASTA format.")
         parser.add_argument("Output_SAM", help= "Name of Output SAM file")
-        
+
         ##Output Handling
         Output_group.add_argument("--Output_Tag", help= "Enter a tag name that will be appended to end of each output file.")
         Output_group.add_argument("--Output_Dir", help= "Enter a directory name that all compiled output files will be saved in.")
         Output_group.add_argument("-Overwrite", action='store_true', help= "Allow overwrite of previous ViReMa output. Will crash if you don't have permissions. Default = Off.")
         Output_group.add_argument("-BAM", action='store_true', help= "Use samtools to make sorted BAM file and BEDGraph. Default = Off.")
-        
-        ##Error Handling Options        
+
+        ##Error Handling Options
         Error_group.add_argument("--N", help= "Number of mismatches tolerated in mapped seed and in mapped segments. Default is 1.")
         Error_group.add_argument("--Seed", help="Number of nucleotides in the Seed region. Default is 25.")
         Error_group.add_argument("--X", help="Number of nucleotides not allowed to have mismatches at 3' end and 5' of segment. \nOverrides seperate ThreePad and FivePad settings. Default is 5.")
@@ -77,17 +77,17 @@ def MainArgs():
         Error_group.add_argument("--BackSplice_limit", help= "Size of Back-Splice or Duplication that is reported. \nDefault size is 0)")
         Error_group.add_argument("--Compound_Handling",  help= "Select this option for compound recombination event mapping (see manual for details). \nEnter number of nucleotides to map (must be less than Seed, and greater than number of nts in MicroInDel). Default is off.")
         Error_group.add_argument("--Internal_Pad",  help= "Enter number of nucleotides to allow within recombinatin events without creating a second segment map (must be less than Seed). Default is MicroInDel Length.")
-        
+
         ##Fuzz Handling
         Fuzz_group.add_argument("--Defuzz", help="Choose how to defuzz data: '5' to report at 5' end of fuzzy region, \n3' to report at 3' end, or '0' to report in centre of fuzzy region. \nDefault is no fuzz handling (similar to choosing Right - see Routh et al).")
         Fuzz_group.add_argument("--MaxFuzz", help="Select maximum allowed length of fuzzy region. Recombination events with longer fuzzy regions will not be reported. Default is Seed Length.")
-        Fuzz_group.add_argument("-FuzzEntry", action='store_true', help="Append Fuzz present in each recombination result. Default is off.")        
-        
+        Fuzz_group.add_argument("-FuzzEntry", action='store_true', help="Append Fuzz present in each recombination result. Default is off.")
+
         ##Host Options
         Host_group.add_argument("--Host_Index", help="Host genome reference index key, e.g. d_melanogaster_fb5_22. Do not add trailing .n.ebwt")
         Host_group.add_argument("--Host_Seed", help="Number of nucleotides in the Seed region when mapping to the Host Genome. Default is same as Seed value.")
-        
-        ##Runtime Options        
+
+        ##Runtime Options
         Runtime_group.add_argument("--MaxIters", help= "Set maximum number of iterations. Default = Length of longest read.")
         Runtime_group.add_argument("--p", help= "Enter number of available processors. Default is 1.")
         Runtime_group.add_argument("--Debug", help= "Print some thigs to text file to help debug. Default is False")
@@ -99,7 +99,7 @@ def MainArgs():
         Alignment_group.add_argument("--Aligner", help="Enter Alignment Software: 'bwa', 'bowtie', 'bowtie2', 'minimap2'. Default is bowtie.")
         Alignment_group.add_argument("--Aligner_Directory", help="Specify directory containing aligner if this error: 'The system cannot find the file specified' appears early in ViReMa run")
         Alignment_group.add_argument("-lr", help="Long read sequencing technology for minimap2: 'ont' (Oxford Nanopore), 'pb' (PacBio), 'hifi' (PacBio HiFi). Only used with minimap2 aligner. Default is short read mode.")
-        
+
         #Compilation Options
         Compilation_group.add_argument("-DeDup", action='store_true', help="Remove potential PCR duplicates. Default is 'off'.")
         Compilation_group.add_argument("--UMI", help="Enter string/delimiter used in read name to define UMI barcode. Default is off.")
@@ -114,7 +114,7 @@ def MainArgs():
         Compilation_group.add_argument("--Coverage_Offset", help= "Read coverage at each these number of nts aways from the junction is given in BED file. Default is 0.")
 
         args = parser.parse_args()
-        
+
         if args.Windows:
                 cfg.Windows = True
         else:
@@ -145,7 +145,7 @@ def MainArgs():
         else:
                 cfg.Lib2 = None
         cfg.File1 = str(args.Input_Data)
-        if cfg.Lib2: 
+        if cfg.Lib2:
             for i in bwts:
                 if i in cfg.Lib1:
                     cfg.Lib1 = cfg.Lib1.split(i)[0]
@@ -176,7 +176,7 @@ def MainArgs():
             except:
                 print("WARNING!", cfg.Output_Dir, "is already present and -Overwrite is selected. Files therein will be overwritten.")
         else:
-                cfg.Output_Dir = cfg.Working_Directory  
+                cfg.Output_Dir = cfg.Working_Directory
 
         if not exists(str(args.Output_SAM)) or cfg.Overwrite == True:
                 cfg.File3 = str(args.Output_SAM)
@@ -268,10 +268,10 @@ def MainArgs():
         if args.Aligner_Directory:
 #            if cfg.Windows:
 #                cfg.Aligner_Directory = str(args.Aligner_Directory) + '\\'
-#            else:                
+#            else:
             cfg.Aligner_Directory = str(args.Aligner_Directory) + '/'
         else:
-                cfg.Aligner_Directory = ''         
+                cfg.Aligner_Directory = ''
         if args.Aligner == 'bwa':
                 cfg.Aligner = 'bwa'
         elif args.Aligner == 'bowtie2':
@@ -335,7 +335,7 @@ def MainArgs():
         else:
                 cfg.Coverage_Offset = 0
         if args.BED12:
-                cfg.BAM = True 
+                cfg.BAM = True
                 ## Requires BAM
                 cfg.BED12 = True
                 if args.Stranded:
@@ -344,8 +344,8 @@ def MainArgs():
                     cfg.Stranded = False
         else:
                 cfg.BED12 = False
-                cfg.Stranded = False     
-                
+                cfg.Stranded = False
+
 ##      ----------------------------------------------------------------------------------------
 ##      Function Countreads will determine the number of complete reads in the given input file.
 ##      ----------------------------------------------------------------------------------------
@@ -377,7 +377,7 @@ def MakeReadDict(FILE):
                 Seq = IN.readline().rstrip()
                 Quals = 'D' * (len(Seq))
                 ReadDict[Name.split()[0][1:]] = [Seq, Quals]
-                Name = IN.readline().rstrip()        
+                Name = IN.readline().rstrip()
     else:
         with OPEN as IN:
             Name = IN.readline().rstrip()
@@ -403,7 +403,7 @@ def Rev_Comp(Seq):
         letters = list(Seq)
         letters = [basecomplement[base] for base in letters]
         return ''.join(letters)[::-1]
-            
+
 ##      ----------------------------------------------------------------------------------------
 ##      Find error density determines if read mapping is legitimate.
 ##      ----------------------------------------------------------------------------------------
@@ -432,12 +432,12 @@ def FindErrorDensity(Align):
         #Ends on Disqualifying Nuc
         NewAlign = Align[:n+1]
     return NewAlign
-       
+
 def MakeCode(Align):
     Code = ''
     MappedLength = 0
     for i in Align:
-        try: 
+        try:
             MappedLength += int(i)
             Code += i + 'M'
         except:
@@ -446,7 +446,7 @@ def MakeCode(Align):
     for i in range(2, cfg.Mismatches+1)[::-1]:
         Code = Code.replace('1X' + '0M1X'*(i-1), (str(i) +'X'))
     return Code, MappedLength
-         
+
 ##      ------------------------------------------------------------------------------------------------------------
 ##      For each read aligned and output to the temporary SAM file, the function FindReadMapping() will extract
 ##      data for any succesfully aligning portions of the read, and then write to a new TEMPREADS file any remaining
@@ -631,14 +631,14 @@ def FindStartNuc(Coords, Ref):
 ##      ----------------------------------------------------------------------------------------
 
 class ReadReport(object):
-    __slots__ = ['Name', 'Segments', 'SEQ', 'QUAL', 'TAGS']    
-    
+    __slots__ = ['Name', 'Segments', 'SEQ', 'QUAL', 'TAGS']
+
     def __init__(self, Name):
         self.Name = Name
         self.Segments = []
         self.SEQ, self.QUAL = ReadDict[Name][0], ReadDict[Name][1]
         self.TAGS = []
-    
+
     def AddSegment(self, Mapping):
             ## Example Mapping = ('SOME', '60M', 'NC_004146.1_FHV_RNA1.seq', '896_955', '', 'N')
             #Xsegment = [Nuc, Count, Code]
@@ -750,7 +750,7 @@ class ReadReport(object):
                                         self.TAGS.append('XI:Z:Sub:' + Insertion)
                                     else:
                                         #complex insertion/pad
-                                        self.Segments.append([Ref, StartNuc, Mapping[1]])                            
+                                        self.Segments.append([Ref, StartNuc, Mapping[1]])
                             elif int(OldCode[-2]) <= cfg.Internal_Pad:
                                 #allowed insertion but must be flagged as internal pad due to length
                                 if 'RevStrand' not in Ref:
@@ -792,7 +792,7 @@ class ReadReport(object):
                                         self.TAGS.append('XI:Z:LongSub:' + Insertion)
                                     else:
                                         #complex insertion/pad
-                                        self.Segments.append([Ref, StartNuc, Mapping[1]])  
+                                        self.Segments.append([Ref, StartNuc, Mapping[1]])
                             else:
                                 ##Large insertion disallowed in SAMfile (will be detected by compiler)
                                 self.Segments.append([Ref, StartNuc, Mapping[1]])
@@ -952,14 +952,14 @@ class ReadReport(object):
                         self.Segments[-1][-1] = NewCode
                     elif self.Segments[-1][-1][-1] == 'M':
                         ##Add Final Softpad to Segment
-                        if RemainingNucs:     
+                        if RemainingNucs:
                             NewCode = self.Segments[-1][-1] + str(RemainingNucs) + 'S'
                             self.Segments[-1][-1] = NewCode
                         else:
                             pass
                 except:
-                    pass   
-                
+                    pass
+
     def __str__(self):
         return str(self.Segments) + str(self.TAGS)
 
@@ -992,7 +992,7 @@ class SAM_Alignment(object):
 
     def AddTag(self, Tag):
         self.TAGS.append(Tag)
-    
+
     def Output(self):
         ##Make NM tag
         x = cigar_regex.findall(self.CIGAR)
@@ -1040,7 +1040,7 @@ def CompleteSAMRead(Name):
             else:
                 if Seg[-1][-1] == 'X':
                     ##Here there are unmapped nucs between two mapped segments
-                    ## This warrants closer attention, e.g. Compound handling                    
+                    ## This warrants closer attention, e.g. Compound handling
                     OldCode = cigar_regex.findall(Seg[-1])
                     LastPad = int(OldCode[-2])
                     if LastPad > cfg.Internal_Pad:
@@ -1369,7 +1369,7 @@ if __name__ == '__main__':
                 Header.close()
     else:
         print("No mapping")
-        
+
     if cfg.BAM or cfg.Compile:
         if cfg.Aligner =='bwa':
             cfg.RefsLib1, cfg.RefsLib2, cfg.Genes = ExtractRefDataBWA()
@@ -1429,7 +1429,7 @@ if __name__ == '__main__':
         ResultsSort(cfg.Output_Dir + cfg.File3)
         if cfg.Debug:
             cfg.Debug.close()
-            
+
 finish = time.time()
 print("Time to complete in seconds: ", int(finish - start))
 ##      ----------------------------------------------------------------------------------------

@@ -5,6 +5,7 @@ Relevant invocations:
   1. python ViReMa.py --Aligner minimap2            (short-read mode)
   2. python ViReMa.py --Aligner minimap2 -lr ont    (Oxford Nanopore mode)
   3. python ViReMa.py --Aligner minimap2 -lr pb     (PacBio CLR mode)
+  4. python ViReMa.py --Aligner minimap2 -lr hifi   (PacBio HiFi mode)
 
 ------------------------------------------------------------------------
 OVERVIEW
@@ -19,13 +20,34 @@ minimap2 backend achieves this by a two-stage strategy:
   rounds. This iterative extraction-and-realignment finds the second
   (and further) segments of a split read.
 
+  For long-read modes (ont/pb/hifi) there is a preliminary step before
+  extraction: minimap2 frequently represents a chimeric read (foreign
+  content spliced in, a cross-segment fusion, a tandem duplication, an
+  inversion) as ONE alignment with the extra content folded into a
+  single large embedded 'I' CIGAR operation, rather than splitting into
+  primary+supplementary records -- there is then no softclip for the
+  extraction step below to ever notice.
+  rewrite_embedded_insertions_as_softclips() finds one qualifying
+  embedded 'I' per record (longer than MicroInDel_Length and at least
+  SEED_THRESHOLD) and rewrites it into an explicit trailing softclip,
+  run on every round's own output. When that softclip is then
+  extracted, it is split into two independent realignment candidates --
+  the insertion content alone, and everything after it alone -- rather
+  than realigned as one glued fragment; see "PHASE 2/3" notes below for
+  why.
+
   Stage 2 - Compilation: Compiler_Module.py reads the ViReMa-formatted
   SAM file and tallies recombination junctions, deletions, insertions,
   and copy-back events into text and BED output files.
 
-The three invocation modes differ only in the minimap2 preset used
-for the initial alignment, how softclipped reads are selected for
-re-alignment, and whether re-alignment is iterated (ONT only).
+The four invocation modes differ only in the minimap2 preset used
+for the initial and re-alignment steps and how softclipped reads are
+selected for re-alignment. All three long-read modes (ont/pb/hifi) now
+share the same iterative re-alignment pipeline and the same embedded-
+insertion rewrite; PacBio CLR/HiFi previously used a single non-iterated
+round with the whole-read preset reused for softclip rescue, which was
+found to fail outright on short extracted fragments, and were unified
+with ONT's short-fragment-tuned, iterative approach.
 
 
 ------------------------------------------------------------------------
@@ -45,11 +67,13 @@ Relevant config variables (ConfigViReMa.py) set by MainArgs():
                       Minimap2_Module
   cfg.Chunk         - Number of reads per processing chunk (default 1M)
 
-Index building: if no .mmi index file exists for the virus reference,
-ViReMa calls:
-  minimap2 -d <Lib1>.mmi <Lib1>
-
-before entering the alignment stage.
+Index building: for minimap2, ViReMa does not pre-build any index -- the
+reference FASTA is passed directly to minimap2 on every invocation (each
+round uses different -k/-w flags, and a prebuilt .mmi index bakes those
+parameters in at build time, silently overriding whatever the command line
+requests; an earlier version of this pipeline built and reused a .mmi index,
+which was found to cause exactly this problem, and the index-build step was
+removed).
 
 
 ------------------------------------------------------------------------
@@ -222,24 +246,58 @@ Step 3 - Extract soft-clipped sequences
   Identical to the short-read case. Clipped sequences >= SEED_THRESHOLD
   are written to TEMP_READS.txt with _softclip_0 / _softclip_1 naming.
 
-Step 4 - Iterative alignment  (run_iterative_ont_alignment)
+Step 4 - Iterative alignment  (run_iterative_ont_alignment(long_read_tech))
 
-  ONT is the only mode that iterates re-alignment. The loop runs up to
-  10 rounds (max_rounds = 10) and terminates early when a round produces
-  no new softclipped sequences.
+  All three long-read modes (ont/pb/hifi) iterate re-alignment via this
+  same function -- earlier, only ONT did; PacBio CLR/HiFi were unified
+  onto it after their single-round, whole-read-preset rescue was found
+  to fail outright on short extracted fragments (confirmed empirically:
+  a 167bp fragment came back unmapped under map-pb but aligned cleanly,
+  MAPQ 60, under the short-fragment preset below). The loop runs up to
+  6 rounds (max_rounds = 6; successful rescues converge by round 3-4 in
+  practice) and terminates early when a round produces no new
+  softclipped sequences.
 
-  Round 2 alignment command (is_initial=False, long_read_tech='ont'):
-    minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,4 -E 2,1
-             --end-bonus 5 -s 20 -z 200 -r 50
-             <Lib1> ./Test_Data/TEMP_READS.txt
+  Round 2+ alignment command (is_initial=False):
+    ONT / PacBio CLR:
+      minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,4 -E 2,1
+               --end-bonus 5 -s 20 -z 200 -r 50
+               <Lib1> ./Test_Data/TEMP_READS.txt
+    PacBio HiFi: same preset with -k 15 (lower error rate supports a
+      larger, more specific minimizer; k=10 is tuned for the ~85%-
+      accuracy ONT/CLR regime).
     Output written to: TEMP_SAM
 
-  Note: although the data originated from ONT, the re-alignment of
-  soft-clip fragments uses short-read parameters (-ax sr). The rationale
-  is that soft-clip fragments are short (>= SEED_THRESHOLD but much
-  shorter than the original read) and must be mapped precisely to
-  identify the exact recombination breakpoint; the relaxed error model
-  of map-ont would produce false-positive placements at this scale.
+  Note: although the data originated from a long-read technology, the
+  re-alignment of soft-clip fragments uses a short-read-style preset
+  (-ax sr base). The rationale is that soft-clip fragments are short
+  (>= SEED_THRESHOLD but much shorter than the original read) and must
+  be mapped precisely to identify the exact recombination breakpoint;
+  the relaxed error model of the whole-read long-read presets would
+  produce false-positive placements, or fail to map at all, at this
+  scale.
+
+  Before each round's output is merged, rewrite_embedded_insertions_as_
+  softclips() runs on it too (not just the initial alignment) -- a
+  rescued fragment can itself contain an embedded chimeric segment that
+  needs a further round to resolve.
+
+  When a softclip came from that rewrite (tagged via a ZI:i: SAM field
+  recording the embedded insertion's own length), it is split into TWO
+  independent realignment candidates instead of one glued fragment:
+  <name>_softclip_<pos>_ins (the insertion content alone) and
+  <name>_softclip_<pos> (everything after it alone, unchanged name).
+  Gluing them is only unambiguous when the insertion's true origin and
+  the following flank fall in increasing reference order; when the
+  donor is on the other side, the glued fragment contains a real
+  backward jump internally and minimap2 resolves it as one confident,
+  silently-wrong placement (anchored on the longer piece) rather than
+  leaving a softclip for the rescue mechanism to notice. Both candidates
+  land at the same fractional sequence-position (see below) so the
+  existing two-segment merge logic pairs them; a corresponding exemption
+  in redundant-segment dedup keeps them from being collapsed back into
+  one, since they are expected to overlap heavily in reference space by
+  design (not treated as competing duplicates).
 
   Each iteration:
     a. TEMP_SAM is merged into output.sam (merge_temp_sam_to_output).
@@ -292,27 +350,26 @@ Step 1 - Initial alignment (build_minimap2_command, long_read_tech='pb',
 Step 2 - Identify soft-clipped primary alignments
   (parse_sam_for_softclipped, long_read_tech='pb')
 
-  Same as the short-read case: the first record for each read name is
-  used (not AS-based selection). This is appropriate for PacBio data
-  where the map-pb preset reliably produces a single dominant primary
-  alignment per read.
+  Same AS-score-based selection as ONT (keep the alignment with the
+  highest AS among primary-like records for a read name) -- this was
+  originally "use the first record" for pb/hifi, unified with ONT's
+  behavior once the difference was found to matter for iterative
+  rescue quality.
 
 Step 3 - Extract soft-clipped sequences
-  Identical to the short-read case.
+  Identical to the ONT case, including the embedded-insertion rewrite
+  and insertion/rest split described in Situation 2, Step 4.
 
-Step 4 - Second-round alignment (build_minimap2_command,
-                                  long_read_tech='pb', is_initial=False)
+Step 4+ - Iterative alignment (run_iterative_ont_alignment('pb'))
 
-  The build_minimap2_command function returns the same map-pb command
-  regardless of the is_initial flag:
-    minimap2 -ax map-pb <Lib1> ./Test_Data/TEMP_READS.txt
-    Output written to: TEMP_SAM
-
-  This is unique to PacBio mode: both the initial alignment and the
-  soft-clip re-alignment use the same map-pb preset, which is
-  appropriate since even a short PacBio CLR fragment has the same
-  error profile as the full read. The alignment is NOT iterated; a
-  single second round is performed.
+  PacBio CLR now shares ONT's iterative rescue loop (max 6 rounds) and
+  short-fragment re-alignment preset (-k 10, same as ONT -- see
+  Situation 2, Step 4) rather than reusing map-pb for rescue. Reusing
+  the whole-read map-pb preset for short extracted fragments was found
+  to fail outright (a 167bp fragment came back completely unmapped
+  under map-pb but aligned cleanly, MAPQ 60, under the short-fragment
+  preset), which was the primary reason PacBio CLR recall lagged ONT
+  despite comparable error rates.
 
 Step 5 - Merge and convert
   merge_temp_sam_to_output() and convert_to_virema_format() are called
@@ -320,6 +377,30 @@ Step 5 - Merge and convert
 
 Step 6 - Compilation
   Identical to the short-read case.
+
+
+------------------------------------------------------------------------
+SITUATION 4: python ViReMa.py --Aligner minimap2 -lr hifi
+             (PacBio HiFi Mode, LongReadTech = 'hifi')
+------------------------------------------------------------------------
+
+Step 1 - Initial alignment (build_minimap2_command, long_read_tech='hifi',
+                             is_initial=True)
+
+  Command:
+    minimap2 -ax map-hifi <Lib1> <File1>
+    Output written to: output.sam
+
+  Parameter rationale:
+    -ax map-hifi - PacBio HiFi preset: long reads with a much lower
+                   (~99%+) per-base error rate than CLR/ONT (built-in
+                   minimap2 preset, no manual overrides). The -Y flag
+                   is not used here either.
+
+Steps 2-6 - Identical to PacBio CLR (Situation 3) in every respect
+  except the round-2+ re-alignment preset uses -k 15 instead of -k 10
+  (see Situation 2, Step 4 for the rationale: HiFi's lower error rate
+  supports a larger, more specific minimizer without losing sensitivity).
 
 
 ------------------------------------------------------------------------
@@ -358,12 +439,34 @@ ResultsSort() logic:
     - The donor and acceptor reference names determine the event class:
         * Same reference, forward strand: deletion or recombination
         * Same reference, one reverse-strand: copy-back / snap-back
+          (the long-read minimap2 path now propagates a reverse-strand
+          segment here when minimap2 itself found one and the
+          softclip-rescue mechanism isolated it as its own segment --
+          see FIXED note at the end of this document. Whether the
+          rescue mechanism isolates a given inversion in the first
+          place is a separate, still-open question -- see the same
+          note)
         * Different references: intergenic fusion / virus-to-host event
     - Compound recombination handling (if enabled): the unaligned
       nucleotides between two recombination junctions are searched in
       the genomic sequence between the donor and acceptor sites. A match
       indicates a compound (nested) recombination event, and the single
       N-gap event is split into two events at the matched position.
+    - Long-read mode only: when two segments are separated by a small
+      residual (below Seed) that doesn't cleanly meet the "adjacent
+      segments" test above, the Donor/Acceptor jump is still classified
+      as Recombination/MicroDeletion/MicroInsertion (mirroring the
+      clean-adjacency logic exactly) rather than discarded as
+      UnknownInsertion -- previously, ANY non-pixel-perfect adjacency
+      fell through to UnknownInsertion, which reported only the small
+      residual's own (uninformative) length and lost the real event
+      entirely. The residual itself is also separately recorded as its
+      own MicroInsertion. Guarded to only fire when the Donor/Acceptor
+      are recognized reference names, working around a separate,
+      pre-existing field-misalignment issue for reads with 3+ segments
+      (documented in git history as a fix for reference names like
+      "NC_004144_FHV_RNA2.seq" landing where a numeric position was
+      expected).
 
   Output files written by WriteFinalDict():
     - Virus_Recombination_Results.txt and .bed: all within-virus
@@ -376,32 +479,121 @@ ResultsSort() logic:
       equivalent files for host-genome events (if --Host_Index is used).
 
   Each BED entry includes:
-    - Donor and acceptor coordinates (0-based BED convention)
+    - Donor and acceptor coordinates (0-based BED convention; for a
+      same-chromosome Deletion/Duplication these come out as raw
+      Donor/Acceptor site order, i.e. NOT necessarily sorted
+      start<=end the way strict BED format expects for a Duplication)
     - Event count (number of supporting reads)
     - Strand
     - Flanking nucleotide context (Seed nt on each side of junction)
     - Optional pseudo-reference sequence (if --PseudoRef is set)
     - Optional flanking coverage (if -BED12 or --Coverage_Offset is set)
 
+  NOTE: WriteFinalDict() has two code paths depending on -ReadNamesEntry,
+  and until this was fixed, the -ReadNamesEntry path never called
+  WritetoBEDFile() at all -- BED output was silently empty for any run
+  using -ReadNamesEntry (which includes every -lr run that also wants
+  per-read attribution). Both paths now call WritetoBEDFile()
+  identically.
+
+  Also NOTE: BED NAME classification (Deletion/Duplication/Insertion/
+  Intergenic-Fusion) is a Donor-vs-Acceptor position/strand comparison
+  applied to whatever event class the run happens to produce; it has no
+  vocabulary for the newer event classes this pipeline can now generate
+  (same-chromosome distant insertions come out labeled Deletion or
+  Duplication depending on jump direction -- mathematically correct
+  direction, semantically not what either word means). A genuine
+  reverse-strand segment reaching the classifier is now labeled
+  correctly (see FIXED note below) rather than always coming out as
+  Deletion.
+
 
 ------------------------------------------------------------------------
-COMPARISON OF THE THREE MODES
+COMPARISON OF THE FOUR MODES
 ------------------------------------------------------------------------
 
-Feature                 Short-read         ONT               PacBio CLR
-----------------------  -----------------  ----------------  -----------
-Initial preset          -ax sr (custom)    -ax map-ont -Y    -ax map-pb
--Y soft-clip flag       No                 Yes               No
-Softclip selection      First record       Highest AS score  First record
-Re-alignment preset     -ax sr (relaxed)   -ax sr (relaxed)  -ax map-pb
-Iterative re-alignment  No (single round)  Yes (up to 10x)  No (single round)
-Nested clip naming      _softclip_0/1      _softclip_0/1     _softclip_0/1
-                                           + recursive levels
-Compilation             Identical          Identical         Identical
+Feature                 Short-read      ONT             PacBio CLR      PacBio HiFi
+-----------------------  --------------  --------------  --------------  --------------
+Initial preset           -ax sr(custom)  hand-tuned -a   -ax map-pb      -ax map-hifi
+                                          flags, -Y
+Softclip selection       First record    Highest AS      Highest AS      Highest AS
+Embedded-insertion       No              Yes             Yes             Yes
+  rewrite + ins/rest
+  split
+Re-alignment preset      -ax sr(relaxed) -k 10 (relaxed) -k 10 (relaxed) -k 15 (relaxed)
+Iterative re-alignment   No (1 round)    Yes (up to 6x)  Yes (up to 6x)  Yes (up to 6x)
+Nested clip naming       _softclip_0/1   _softclip_0/1   _softclip_0/1   _softclip_0/1
+                                         (+ recursive, + _ins variants for all three)
+Compilation              Identical       Identical       Identical       Identical
 
-All modes write a ViReMa-compatible SAM in which each split read is
+All four modes write a ViReMa-compatible SAM in which each split read is
 represented either as a single record with N gaps in the CIGAR (for
 contiguous recombination on the same reference) or as a primary plus
 supplementary record pair with hard clips (for cross-reference or
 back-splice events). The downstream Compiler_Module is unaware of
 which aligner mode was used.
+
+
+------------------------------------------------------------------------
+FIXED: strand information was discarded before classification
+------------------------------------------------------------------------
+Investigated while testing inversion detection. minimap2 correctly finds
+reverse-strand alignments for inverted content once it has been isolated
+by the softclip-rescue mechanism above (confirmed directly: an isolated
+inversion candidate aligned at flag=16 (reverse), MAPQ=60, at the true
+inversion boundary) -- and Compiler_Module.py's classifier already has
+working _RevStrand-aware logic to turn that into a distinct event class
+(it is exercised correctly by the short-read pipeline, which tags
+reverse-strand segments via the SAM FLAG at conversion time -- see
+ViReMa.py's short-read SAM-to-ViReMa conversion path).
+
+The long-read (Minimap2_Module.py) conversion path previously did not
+propagate this: three separate record-construction sites unconditionally
+hard-coded the SAM strand flag to forward before the record ever reached
+classification (convert_single_read, create_single_merged_record_new,
+create_paired_records_new). This is now fixed -- all three preserve
+strand.
+
+The fix needed one subtlety beyond simply not hard-coding the flag.
+Every merged/paired record is built from primary_read.copy(), so its
+SEQ field is always primary_read's own SEQ -- a fixed shared frame. A
+segment's raw SAM strand bit is relative to the *original as-sequenced
+read*, not to that frame. For the primary segment itself the two happen
+to be different things: whatever minimap2 reported for the whole read's
+own strand during the initial search is irrelevant once primary_read's
+SEQ becomes everyone's shared frame -- by construction, the primary
+segment's own CIGAR is always forward relative to its own SEQ. Treating
+its raw absolute flag as the record's strand instead of always 0 caused
+a real, measured regression on ordinary (non-inversion) DUP/CISINS
+benchmark cells: since long-read sequencing is strand-agnostic, roughly
+half of all reads have their whole-read primary alignment reported
+reverse for no event-related reason, and the naive fix spuriously
+flipped the Donor/Acceptor junction side used for position calculation
+whenever that happened. Independently re-aligned rescue segments don't
+have this problem -- their own reported flag, from a call that queried a
+literal substring of primary_read's SEQ, is already relative to the
+correct shared frame, so it's used as-is.
+
+_segment_strand() (Minimap2_Module.py) now implements exactly this:
+returns 0 unconditionally for the 'main'/primary segment, and the
+segment's own true SAM strand bit for everything else. Verified against
+the DUP-100bp, CISINS-1000bp, and DEL-1000bp benchmark cells: TP/FP now
+match the pre-fix baseline exactly (DUP 19/64, CISINS 108/149) or are
+consistent with prior validated performance (DEL 65/66) -- i.e. the
+regression is fully resolved, not merely reduced.
+
+SEPARATE, STILL-OPEN ISSUE: testing this fix against a real synthetic
+inversion (a 1000bp reverse-complemented block in a ~30kb reference)
+through the actual production entry point (ViReMa.py directly, not a
+hand-rolled pipeline replay used during initial debugging) shows the
+ONT preset's very cheap gap costs (-O 2,32 -E 1,0 -z 200 -g 2000, tuned
+to prefer long deletions) make it *cheaper* for minimap2 to plow
+straight through the reverse-complemented block as a dense run of
+small-indel noise within one alignment record than to soft-clip it out.
+With no softclip produced, the rescue mechanism never gets a chance to
+act on that region at all -- there is nothing to re-align, so this
+strand fix has nothing to preserve. So while strand information is no
+longer discarded once found, genuine inversion detection for an
+inversion of this size is not demonstrated to work under the current
+ONT preset. This looks like a separate, alignment-parameter-tuning
+problem, not a classification/strand-propagation problem.
