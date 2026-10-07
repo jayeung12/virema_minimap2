@@ -62,7 +62,7 @@ Only the alignment with the highest alignment score has its softclips sent for a
 
 When a softclip came from the embedded-insertion rewrite above, it is split into **two independent realignment candidates** instead of one glued fragment: the insertion content alone (`..._softclip_1_ins`) and everything after it alone (`..._softclip_1`). Gluing them together is only unambiguous when the insertion's true origin and the following flank sit in increasing reference order; when the donor sits on the other side, the glued fragment contains a real backward jump internally, and minimap2 resolves it as one confident, silently-wrong placement (anchored on whichever piece is longer) rather than leaving a softclip the rescue mechanism would notice. Realigning the two pieces independently removes that failure mode regardless of which way the jump points. A matching exemption in the redundant-segment dedup step (below) keeps the two halves from being collapsed back into one, since they're expected to overlap heavily in reference space by design.
 
-Sometimes, mapping softclips will have further softclips that exceed threshold length. These are sent for another round of mapping where the read name has an additional softclip_0 or softclip_1 appended to the read name in the intermediate file (output.sam). If these softclips map, they are stitched back to the primary alignment in the correct order. Softclips that remain unmapped but are internal (not at the ends of the final, stitched together mapping) are turned into I events in the CIGAR string. Segments that map to the same locus as an already-kept segment (e.g. a nested softclip rediscovering what its own parent's supplementary already found) are deduplicated, keeping whichever has more aligned query bases. See SOFTCLIP_MERGING_LOGIC.md for more details.
+Sometimes, mapping softclips will have further softclips that exceed threshold length. These are sent for another round of mapping where the read name has an additional softclip_0 or softclip_1 appended to the read name in the intermediate file (`<Output_SAM>_temp`). If these softclips map, they are stitched back to the primary alignment in the correct order. Softclips that remain unmapped but are internal (not at the ends of the final, stitched together mapping) are turned into I events in the CIGAR string. Segments that map to the same locus as an already-kept segment (e.g. a nested softclip rediscovering what its own parent's supplementary already found) are deduplicated, keeping whichever has more aligned query bases. See SOFTCLIP_MERGING_LOGIC.md for more details.
 
 ### 3. Result Merging and Classification
 
@@ -109,10 +109,14 @@ read1  2048  ref    50   255   59H31M          *      0      0     ...  ...   FI
 
 ## Intermediate Files
 
-- **`output.sam`**: Complete alignment results (initial + merged softclip alignments)
+As with the `TEMPREADS`/`TEMPSAM1` files of the bowtie/bwa workflow, these are written to `--Output_Dir`
+(the current directory if unset) and removed once alignment has finished. With `--Debug`, the
+intermediate SAM and `multiRound` are kept.
+
+- **`<Output_SAM>_temp`**: Complete alignment results (initial + merged softclip alignments)
 - **`multiRound`**: Filtered reads with qualifying softclipped regions 
 - **`TEMP_SAM`**: Secondary alignment results for extracted softclips
-- **`Test_Data/TEMP_READS.txt`**: FASTA format extracted softclipped sequences
+- **`TEMP_READS.txt`** (`TEMP_READS_R<n>.txt` in later rounds): FASTA format extracted softclipped sequences
 
 ## System Requirements
 

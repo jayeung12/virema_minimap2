@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import subprocess
 import re
 import sys
@@ -26,17 +27,34 @@ ALIGNER_DIRECTORY = ''  # cfg.Aligner_Directory, already formatted with a traili
 # operates on CIGAR/SAM content, not on which aligner preset produced it.
 ITERATIVE_RESCUE_TECHS = ('ont', 'pb', 'hifi')
 
+# Intermediate files. Like the TEMPREADS/TEMPSAM1 files of the bowtie/bwa workflow in ViReMa.py,
+# these live in cfg.Output_Dir and are removed once alignment has finished; run_minimap2_workflow()
+# sets the real paths. INTERMEDIATE_SAM and MULTIROUND_FILE are kept when --Debug is set.
+TEMP_DIR = ''
+INTERMEDIATE_SAM = 'output.sam'
+MULTIROUND_FILE = 'multiRound'
+TEMP_READS_FILE = 'TEMP_READS.txt'
+TEMP_SAM_FILE = 'TEMP_SAM'
+KEEP_INTERMEDIATES = False
+
 def run_minimap2_workflow(config):
     """
     Main entry point for minimap2 workflow when called from ViReMa
     Uses ViReMa configuration parameters
     """
     global VIRUS_INDEX, INPUT_DATA, OUTPUT_SAM, SEED_THRESHOLD, MICROINDEL_THRESHOLD, CHUNK_SIZE, THREADS, ALIGNER_DIRECTORY
+    global TEMP_DIR, INTERMEDIATE_SAM, MULTIROUND_FILE, TEMP_READS_FILE, TEMP_SAM_FILE, KEEP_INTERMEDIATES
 
     # Set parameters from ViReMa config
     VIRUS_INDEX = config.Lib1
     INPUT_DATA = config.File1
     OUTPUT_SAM = config.Output_Dir + config.File3
+    TEMP_DIR = config.Output_Dir
+    INTERMEDIATE_SAM = OUTPUT_SAM + '_temp'
+    MULTIROUND_FILE = TEMP_DIR + 'multiRound'
+    TEMP_READS_FILE = TEMP_DIR + 'TEMP_READS.txt'
+    TEMP_SAM_FILE = TEMP_DIR + 'TEMP_SAM'
+    KEEP_INTERMEDIATES = bool(getattr(config, 'Debug', False))
     SEED_THRESHOLD = int(config.Seed) if config.Seed else 25
     MICROINDEL_THRESHOLD = int(config.MicroInDel_Length) if config.MicroInDel_Length else 0
     THREADS = config.Threads if config.Threads else '1'
@@ -62,24 +80,24 @@ def run_minimap2_workflow(config):
     try:
         # Step 1: Run initial minimap2 alignment
         cmd = build_minimap2_command(INPUT_DATA, long_read_tech, is_initial=True)
-        with open('output.sam', 'w') as f:
+        with open(INTERMEDIATE_SAM, 'w') as f:
             subprocess.run(cmd, stdout=f, check=True)
         print("Initial minimap2 alignment completed")
 
         # Step 1b: Convert any large embedded insertions into explicit soft-clips so the
         # existing rescue pipeline below finds them like any other soft-clipped read.
         if long_read_tech in ITERATIVE_RESCUE_TECHS:
-            rewrite_embedded_insertions_as_softclips('output.sam', MICROINDEL_THRESHOLD, SEED_THRESHOLD)
+            rewrite_embedded_insertions_as_softclips(INTERMEDIATE_SAM, MICROINDEL_THRESHOLD, SEED_THRESHOLD)
 
         # Step 2: Parse SAM for softclipped reads with only primary alignment
         softclipped_reads = parse_sam_for_softclipped(long_read_tech)
 
         if softclipped_reads:
             # Step 3: Save to multiRound file (this was mainly for debugging but can be informative in real runs)
-            with open('multiRound', 'w') as f:
+            with open(MULTIROUND_FILE, 'w') as f:
                 for read_name, data in softclipped_reads.items():
                     f.write(data['line'] + '\n')
-            print(f"Saved {len(softclipped_reads)} softclipped reads to multiRound")
+            print(f"Saved {len(softclipped_reads)} softclipped reads to {MULTIROUND_FILE}")
 
             # Step 4: Extract softclipped sequences
             temp_sequences = []
@@ -100,7 +118,7 @@ def run_minimap2_workflow(config):
                         )
 
             # Save to TEMP_READS.txt
-            with open('./Test_Data/TEMP_READS.txt', 'w') as f:
+            with open(TEMP_READS_FILE, 'w') as f:
                 for read_name, seq in temp_sequences:
                     f.write(f">{read_name}\n{seq}\n")
 
@@ -109,16 +127,16 @@ def run_minimap2_workflow(config):
                 run_iterative_ont_alignment(long_read_tech)
             else:
                 # Plain short-read mode: run single second round
-                cmd = build_minimap2_command('./Test_Data/TEMP_READS.txt', long_read_tech, is_initial=False)
-                with open('./TEMP_SAM', 'w') as f:
+                cmd = build_minimap2_command(TEMP_READS_FILE, long_read_tech, is_initial=False)
+                with open(TEMP_SAM_FILE, 'w') as f:
                     subprocess.run(cmd, stdout=f, check=True)
                 print("Round 2 minimap2 alignment completed")
 
             # Step 6: Merge results (only for the single-round fallback -- the iterative path
             # merges internally after every round)
             if long_read_tech not in ITERATIVE_RESCUE_TECHS:
-                merge_temp_sam_to_output('./TEMP_SAM')
-                print("Results merged back into output.sam with grouped reads")
+                merge_temp_sam_to_output(TEMP_SAM_FILE)
+                print(f"Results merged back into {INTERMEDIATE_SAM} with grouped reads")
 
         # Step 7: Convert to ViReMa format
         convert_to_virema_format()
@@ -126,6 +144,8 @@ def run_minimap2_workflow(config):
 
         # Clear cache to free memory after processing
         clear_softclip_cache()
+
+        remove_intermediate_files()
 
     except Exception as e:
         print(f"Error in minimap2 workflow: {e}")
@@ -204,6 +224,18 @@ def parse_sam_file(sam_file, filter_func=None):
                 results.append(fields)
     return results
 
+def remove_intermediate_files():
+    """Remove this run's intermediate files; --Debug keeps the intermediate SAM and multiRound"""
+    files = [TEMP_SAM_FILE, TEMP_READS_FILE]
+    if not KEEP_INTERMEDIATES:
+        files += [INTERMEDIATE_SAM, MULTIROUND_FILE]
+    for file_path in files:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError as e:
+            print(f"Warning: Could not remove {file_path}: {e}")
+
 def parse_sam_for_softclipped(long_read_tech=None):
     """Find reads with primary alignment and softclipping (ignore supplemental alignments)"""
     # Parse SAM file for primary alignments with softclips
@@ -212,7 +244,7 @@ def parse_sam_for_softclipped(long_read_tech=None):
         cigar = fields[5]
         return not (flag & 2048) and 'S' in cigar  # Not supplemental and has softclip
 
-    alignments = parse_sam_file('output.sam', is_primary_with_softclip)
+    alignments = parse_sam_file(INTERMEDIATE_SAM, is_primary_with_softclip)
 
     # Group alignments by read name
     read_alignments = defaultdict(list)
@@ -423,8 +455,8 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
     max_rounds = 6  # Safety limit to prevent infinite loops -- successful rescues observed to
                      # converge by round 3-4, so this bounds worst-case cost for reads that
                      # never resolve without affecting reads that do
-    current_temp_file = './Test_Data/TEMP_READS.txt'
-    temp_sam_file = './TEMP_SAM'
+    current_temp_file = TEMP_READS_FILE
+    temp_sam_file = TEMP_SAM_FILE
 
     print(f"Starting iterative {long_read_tech} alignment process...")
 
@@ -435,7 +467,7 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
     print("Round 2 minimap2 alignment completed")
     rewrite_embedded_insertions_as_softclips(temp_sam_file, MICROINDEL_THRESHOLD, SEED_THRESHOLD)
 
-    # Process alignment results and merge into output.sam
+    # Process alignment results and merge into the intermediate SAM
     merge_temp_sam_to_output(temp_sam_file)
 
     while round_num < max_rounds:
@@ -470,7 +502,7 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
 
         # Prepare next round's input file
         round_num += 1
-        next_temp_file = f'./Test_Data/TEMP_READS_R{round_num}.txt'
+        next_temp_file = f'{TEMP_DIR}TEMP_READS_R{round_num}.txt'
 
         # Write new softclips to next round's input file
         with open(next_temp_file, 'w') as f:
@@ -480,7 +512,6 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
         print(f"Round {round_num-1} generated {len(new_softclips)} new softclips for round {round_num}")
 
         # Clean up previous temp files before next round
-        import os
         for file_path in [temp_sam_file, current_temp_file]:
             try:
                 if os.path.exists(file_path):
@@ -502,7 +533,6 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
         merge_temp_sam_to_output(temp_sam_file)
 
     # Final cleanup
-    import os
     for file_path in [temp_sam_file, current_temp_file]:
         try:
             if os.path.exists(file_path):
@@ -635,12 +665,12 @@ def select_alignments_for_identifier(alignments):
     return [best_primary] + supplementaries
 
 def merge_temp_sam_to_output(temp_sam_file):
-    """Merge a single TEMP_SAM file into output.sam with AS-based selection for softclips"""
+    """Merge a single TEMP_SAM file into the intermediate SAM with AS-based selection for softclips"""
     # Load original reads
     original_headers = []
     original_reads = {}
 
-    with open('output.sam', 'r') as f:
+    with open(INTERMEDIATE_SAM, 'r') as f:
         for line in f:
             if line.startswith('@'):
                 original_headers.append(line)
@@ -707,7 +737,7 @@ def merge_temp_sam_to_output(temp_sam_file):
                 selected_temp_reads[base_read_name].extend(select_alignments_for_identifier(alignments))
 
     # Write merged output
-    with open('output.sam', 'w') as f:
+    with open(INTERMEDIATE_SAM, 'w') as f:
         # Write headers first
         for line in original_headers:
             f.write(line)
@@ -742,7 +772,7 @@ def convert_to_virema_format():
 
     # Check file size for memory optimization guidance
     try:
-        file_size = os.path.getsize('output.sam')
+        file_size = os.path.getsize(INTERMEDIATE_SAM)
         if file_size > 500 * 1024 * 1024:  # 500MB
             print(f"Processing large SAM file ({file_size // (1024*1024):,} MB) using chunked processing...")
     except OSError:
@@ -754,7 +784,7 @@ def convert_to_virema_format():
     reads_with_softclips = set()
 
     print("Loading SAM file and identifying reads...")
-    with open('output.sam', 'r') as f:
+    with open(INTERMEDIATE_SAM, 'r') as f:
         for line in f:
             if line.startswith('@'):
                 headers.append(line)
@@ -1242,9 +1272,11 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
 
     return records
 
-def get_mapped_softclip_positions(base_read_name, sam_file='output.sam'):
+def get_mapped_softclip_positions(base_read_name, sam_file=None):
     """Parse intermediate SAM file to determine which nested softclip read names are actually mapped"""
     mapped_read_names = set()
+    if sam_file is None:
+        sam_file = INTERMEDIATE_SAM
 
     with open(sam_file, 'r') as f:
         for line in f:
@@ -1268,9 +1300,11 @@ def get_mapped_softclip_positions(base_read_name, sam_file='output.sam'):
 # Global cache for Python implementation
 _softclip_cache = None
 
-def get_mapped_softclip_positions_cached(base_read_name, sam_file='output.sam'):
+def get_mapped_softclip_positions_cached(base_read_name, sam_file=None):
     """Python cached version of get_mapped_softclip_positions - reads file once and caches all results"""
     global _softclip_cache
+    if sam_file is None:
+        sam_file = INTERMEDIATE_SAM
 
     # Check if cache exists
     if _softclip_cache is not None:
@@ -1356,7 +1390,7 @@ def update_hardclipped_values(read):
         read[9] = updated_sequence
         read[10] = updated_quality
 
-def build_hierarchical_accounting_map(base_read_name, segments, sam_file='output.sam'):
+def build_hierarchical_accounting_map(base_read_name, segments, sam_file=None):
     """Build accounting map that considers the hierarchical softclip structure"""
     # Get all mapped softclip read names from SAM file - use cached version
     mapped_read_names = get_mapped_softclip_positions_cached(base_read_name, sam_file)
