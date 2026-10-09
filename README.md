@@ -130,6 +130,55 @@ cross-segment insertions, same-chromosome cross-locus insertions, and an edge-of
 proximity sweep, each across ONT/PacBio CLR/PacBio HiFi) -- see that suite's own README for
 methodology and numbers.
 
+- **Insertions sitting at a recombination junction are now reported** (`Minimap2_Module.py`,
+  `Compiler_Module.py`): an insert only ever reached `Virus_Insertions.txt` and
+  `Read_Events.tsv` when its flanking coordinates happened to be adjacent
+  (`acceptor == donor + 1`). An insert at a junction was routed to the `UnknownRecombination`
+  counter, whose output file is commented out, so the junction *and* the inserted sequence were
+  both discarded. Found on a NanoLuc reporter influenza library (SRR34426338), where a 577nt
+  NanoLuc+2A cassette between NS 657 and NS 1 appeared in no output file at all while an 88nt
+  insert between NS 724 and 725 was reported normally. Three separate defects:
+  - **The inserted bases were not in the SAM's coordinate system.** When a fragment's own
+    realignment failed, `merge_split_alignments()` dropped it (`flag & 4`), and the segment that
+    would have carried its bases as a soft clip could then be removed by
+    `_dedupe_redundant_segments()` in favour of an equivalent record that HARD-clips them. The
+    merged records described a shorter read than was sequenced, and `SEQ` stopped matching
+    `CIGAR` (105 of 201 records on a 120-read fixture; samtools refused the file outright).
+    Unplaced fragments are now kept and reconciled back into the merged CIGAR as an explicit soft
+    clip at the position their softclip path puts them in.
+  - **A trailing soft clip before a terminal hard clip was rewritten to `I`**, because the
+    "internal softclip" test counted the terminal clip as a bounding operation. That produces an
+    insertion hanging off the end of an alignment (invalid SAM) and splits one insert across two
+    records.
+  - **Two adjacent unmapped fields shifted every later field.** `ResultsSort()` reads an insert
+    as `line[i+2]` and its acceptor as `line[i+3]`, i.e. it assumes at most one unmapped field
+    between two mapped segments; a split insert gave it two, so raw sequence landed in the
+    acceptor-reference column (607 rows on SRR34426338). Runs are now merged by
+    `CoalesceUnmappedFields()`.
+
+  A junction carrying an insert now emits **two rows** in `Read_Events.tsv` at the same
+  `segment_index` -- the junction, classified by its own jump size exactly as a clean junction
+  is, and the insert -- and the sequence goes to `Virus_Insertions.txt` keyed on the same
+  donor/acceptor pair. No new event categories. Measured on the full SRR34426338 library
+  (145,547 reads): 4,722 insert rows at the cassette junction with a **median size of 577**, the
+  cassette's exact length, and every sampled recorded sequence aligns to it; the 3,312 reads
+  carrying the junction still report it; rows with raw sequence in the acceptor-reference column
+  went 607 -> 0; records whose `SEQ` disagreed with their `CIGAR` went 16,531 -> 92 of 162,712;
+  "Unknown or Ambiguous Recombination Events" went 10,240 -> 0. On the bundled FHV short-read
+  test data a 979nt deletion carrying a 13nt insert was previously discarded entirely and is now
+  reported -- the only change to that dataset's results, and its SAM stays byte-identical. On
+  SRR37793484 (HiFi) the 31 "Unknown or Ambiguous" events became 31 recombinations plus 32
+  insertions, and invalid records went 4 -> 1.
+
+  **Not fixed by this change**: the residual 92 records (and that 1 HiFi read) are a separate
+  pre-existing defect in which two groups claim the same query bases, so the CIGAR over-claims
+  the read and there is no soft clip left to trim against. samtools therefore still refuses the
+  full SRR34426338 output, though at 0.06% of records rather than 10.2%.
+  Also guarded: the single-interval BED writes name ONE reference but were handed the acceptor
+  coordinate of cross-segment junctions, which indexes past the end of the coverage array in
+  `BEDGraph_Plot()`. Previously unreachable because those events were being discarded; the guard
+  the original author sketched in a comment on that line is now active, comparing bare reference
+  names so same-segment strand flips keep their existing behaviour.
 - **Insertion-in-isolation rescue** (`Minimap2_Module.py`): see "Softclip Extraction and
   Re-alignment" above. Fixes confidently-wrong placements for cross-locus insertions whose donor
   sits downstream of the acceptor.

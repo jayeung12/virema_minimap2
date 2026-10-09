@@ -145,6 +145,10 @@ def BEDGraph_Plot():
                 Acceptorsite = int(line[2])
                 Count = int(line[4])
                 Strand = line[5]
+                if max(Donorsite, Acceptorsite) > len(DelCover[Gene_Name]) or min(Donorsite, Acceptorsite) < 0:
+                    #Coordinate outside this reference (e.g. a cross-segment partner) -- skip
+                    #rather than index past the end of the coverage array.
+                    continue
                 if Strand == '+':
                     if Donorsite < Acceptorsite:
                         while Donorsite < Acceptorsite:
@@ -567,6 +571,53 @@ def ContractX(x):
 ##      originally used in ViReMa to compile recombination results.
 ##      -----------------------------------------------------------------------
 
+##      -----------------------------------------------------------------------
+##      CoalesceUnmappedFields() merges runs of consecutive unmapped fields into one.
+##      ResultsSort() locates an insert as line[i+2] and its acceptor as line[i+3], i.e. it
+##      assumes at most ONE unmapped field between two mapped segments. Two or more (which
+##      happens when one insert is split across a record boundary, or when a record's own
+##      trailing clip abuts the next record's leading clip) shift every later field by one, so
+##      raw sequence lands in the acceptor-reference slot and the event is mis-reported.
+##      -----------------------------------------------------------------------
+
+def CoalesceUnmappedFields(Totalline, TotalCode):
+    Tokens = findall(r"(\d+)(\D)", TotalCode)
+    #Each M token owns two fields (reference name, coordinates); every other token owns one. If
+    #that does not add up, the line was already out of step with its code before we got here, so
+    #return it untouched rather than walking off the end -- degrading to the previous behaviour
+    #is better than raising on someone's dataset.
+    Expected = 1 + sum(2 if Letter == 'M' else 1 for _, Letter in Tokens)
+    if Expected != len(Totalline):
+        return Totalline, TotalCode
+    OutFields = [Totalline[0]]
+    OutCode = []
+    Idx = 1
+    i = 0
+    while i < len(Tokens):
+        Length, Letter = Tokens[i]
+        if Letter == 'M':
+            OutFields.append(Totalline[Idx])
+            OutFields.append(Totalline[Idx + 1])
+            Idx += 2
+            OutCode.append(Length + 'M')
+            i += 1
+        else:
+            Seq = ''
+            Total = 0
+            Kind = 'X'
+            while i < len(Tokens) and Tokens[i][1] != 'M':
+                Seq += Totalline[Idx]
+                Idx += 1
+                Total += int(Tokens[i][0])
+                if Tokens[i][1] == 'U':
+                    Kind = 'U'
+                i += 1
+            OutFields.append(Seq)
+            OutCode.append(str(Total) + Kind)
+    OutFields += Totalline[Idx:]
+    return OutFields, ''.join(OutCode)
+
+
 def RecreateOldFormatfromSAM(lines):
     Totalline = []
     TotalCode = []
@@ -713,6 +764,7 @@ def RecreateOldFormatfromSAM(lines):
         Totalline += line
         TotalCode += Code
     TotalCode = ''.join(TotalCode)
+    Totalline, TotalCode = CoalesceUnmappedFields(Totalline, TotalCode)
     Totalline.append(TotalCode)
     return Totalline
 
@@ -944,19 +996,32 @@ def ResultsSort(File1):
                         else:
                             pass
                         #BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
-                        if TargetFile == VirusRecs:# and Genes[0] == Genes[1]:
+                        #A single-interval BED row names ONE reference, so both of its
+                        #coordinates have to belong to that reference. A cross-segment junction
+                        #(and any insert recorded at one) has an acceptor coordinate on a
+                        #different segment, which is meaningless in this row and indexes past the
+                        #end of the reference array in BEDGraph_Plot(). Such events are already
+                        #written to the BEDPE file, which can express two references, so skip
+                        #them here rather than emitting a row no consumer can read. This is the
+                        #guard the original author had sketched out on this line but left
+                        #commented; it only became reachable once junctions carrying an insert
+                        #stopped being discarded into the UnknownRecombination counter.
+                        RefLength = len(cfg.Genes.get(Genes[0], ''))
+                        SingleIntervalOK = (len(Genes) < 2 or Genes[0] == Genes[1]) and (
+                            RefLength == 0 or (int(Entry[0]) <= RefLength and int(Entry[2]) <= RefLength))
+                        if TargetFile == VirusRecs and SingleIntervalOK:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusRecs_BED.write(BED_OUTPUT + "\n")
-                        elif TargetFile == VirusInsertions:
+                        elif TargetFile == VirusInsertions and SingleIntervalOK:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusRecs_BED.write(BED_OUTPUT + "\n")
-                        elif TargetFile == VirusuIns or TargetFile == VirusuDels:
+                        elif (TargetFile == VirusuIns or TargetFile == VirusuDels) and SingleIntervalOK:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
@@ -1186,6 +1251,11 @@ def ResultsSort(File1):
                         for i in Index[0][:-1]:
                                 EventType = None
                                 EventSize = None
+                                #A junction carrying inserted sequence is two facts at one point
+                                #in the read: the jump, and the insert sitting in it. The insert
+                                #is written as its own row sharing the junction's segment_index,
+                                #so read order is preserved and the block count stays derivable.
+                                ExtraEvent = None
                                 Donor = line[i]
                                 #Ref = Donor
                                 if "RevStrand" in line[i+1]:
@@ -1339,85 +1409,48 @@ def ResultsSort(File1):
                                                     EventType, EventSize = "Substitution", len(Insertion)
                                                     AddInsToDict(Donor, AcceptorSite, DonorSite, Insertion, SubDicts, ReadName)
                                         else:
-                                                if len(Insertion) >= int(cfg.Seed) or len(Insertion) >= int(cfg.Host_Seed):
-                                                    #Mapable Insertion/Recombination
-                                                    UnknownRecombinationCount += 1
-                                                    HasRealEvent = True
-                                                    EventType, EventSize = "UnknownRecombination", len(Insertion)
-                                                    UnRec = 'Y'
-                                                else:
-                                                    if cfg.Compound_Handling and len(Insertion) > int(cfg.Compound_Handling) and Donor == Acceptor and Donor in cfg.RefsLib1:
-                                                        #Compound Recombination
+                                                #Insert sitting between two mapped segments whose flanking coordinates are NOT
+                                                #contiguous: that is a junction which carries inserted sequence. Report BOTH --
+                                                #the junction, classified by its own jump size exactly as the clean-adjacency
+                                                #branch above does, and the insert itself as its own event in read order.
+                                                #
+                                                #Previously any insert >= Seed was routed to the UnknownRecombination counter,
+                                                #whose output file is commented out, so a real junction AND real inserted
+                                                #sequence were both discarded; the only insert that ever reached
+                                                #Virus_Insertions.txt was one whose flanks happened to be adjacent. A 577nt
+                                                #reporter cassette between two flanks 656nt apart was therefore invisible while
+                                                #an 88nt insert between adjacent flanks was reported normally.
+                                                CompoundResolved = False
+                                                if cfg.Compound_Handling and len(Insertion) > int(cfg.Compound_Handling) and Donor == Acceptor and Donor in cfg.RefsLib1:
+                                                        #The insert was found in the reference between the two flanks, so it is
+                                                        #not inserted sequence at all -- it resolves into two junctions.
                                                         CompoundCount += 1
-                                                        CompTest = Compound_Handling_Script(Donor, DonorSite, Insertion, AcceptorSite, uDelDicts, RecDicts, ReadName)
-                                                        if CompTest == "HIT":
-                                                            RecombCount += 2
-                                                            ViralRecombinationCount += 2
-                                                            CompoundCount += 1
-                                                            HasRealEvent = True
+                                                        if Compound_Handling_Script(Donor, DonorSite, Insertion, AcceptorSite, uDelDicts, RecDicts, ReadName) == "HIT":
+                                                                RecombCount += 2
+                                                                ViralRecombinationCount += 2
+                                                                CompoundCount += 1
+                                                                HasRealEvent = True
+                                                                CompoundResolved = True
+                                                if CompoundResolved:
+                                                        pass
+                                                elif (Donor in cfg.RefsLib1 or Donor in cfg.RefsLib2) and (Acceptor in cfg.RefsLib1 or Acceptor in cfg.RefsLib2):
+                                                        #Classify the underlying junction by its own jump size. Computed once so that
+                                                        #no geometry can fall through unclassified -- flanks that OVERLAP give a jump
+                                                        #of <= 0, which must still be reported as a junction rather than leaving the
+                                                        #insert as an orphan row with no junction attached to it.
+                                                        if "_RevStrand" in Donor:
+                                                                JumpSize = int(DonorSite) - int(AcceptorSite) - 1
                                                         else:
-                                                            #Unknown Compound
-                                                            UnRec = 'Y'
-                                                            UnknownRecombinationCount += 1
-                                                            HasRealEvent = True
-                                                    elif cfg.LongReadTech and (Donor in cfg.RefsLib1 or Donor in cfg.RefsLib2) and (Acceptor in cfg.RefsLib1 or Acceptor in cfg.RefsLib2):
-                                                        # Guard: Donor/Acceptor must be recognized reference names (not,
-                                                        # e.g., raw sequence data from a mis-indexed field on some other
-                                                        # read shape -- a pre-existing indexing issue, unrelated to this
-                                                        # change, that surfaced because this is the first code path in
-                                                        # this branch that needs Donor/Acceptor to be real chromosome
-                                                        # names rather than just printing them). Falls back to the
-                                                        # original UnknownInsertion path below when not recognized,
-                                                        # matching pre-existing behavior for that edge case.
-                                                        #
-                                                        # Residual < Seed, long-read only -- too small to ever be
-                                                        # independently seed-mappable (ViReMa's own existing definition
-                                                        # of noise, matching the len(seq) >= SEED_THRESHOLD gates used
-                                                        # throughout Minimap2_Module.py), so this is ordinary noise
-                                                        # sitting at a real junction, not a second event to solve for.
-                                                        # Classify the underlying Donor/Acceptor jump exactly as the
-                                                        # clean-adjacency block above does (by jump size), and when it
-                                                        # resolves to a real Recombination, ALSO separately record the
-                                                        # residual itself as its own MicroInsertion rather than
-                                                        # silently discarding it.
-                                                        if Donor == Acceptor and "_RevStrand" in Donor and fabs(int(DonorSite) - int(AcceptorSite) - 1) <= cfg.MicroInDel_Length:
-                                                            if int(DonorSite) - int(AcceptorSite) - 1 < 0:
-                                                                    #MicroInsertion on negative strand
-                                                                    uCount += 1
-                                                                    DonorA = Donor[:-10]
-                                                                    MicroInsContent = cfg.Genes[DonorA][int(DonorSite) - 1:int(AcceptorSite)]
-                                                                    MicroInsContent = Rev_Comp(MicroInsContent)
-                                                                    NewAcceptorSite = str(int(DonorSite) - 1)
-                                                                    EventType, EventSize = "MicroInsertion", len(MicroInsContent)
-                                                                    AddInsToDict(Donor, DonorSite, NewAcceptorSite, MicroInsContent, uInsDicts, ReadName)
-                                                            elif int(DonorSite) - int(AcceptorSite) - 1 > 0:
-                                                                    #MicroDeletion on negative strand
-                                                                    uCount += 1
-                                                                    EventType, EventSize = "MicroDeletion", int(DonorSite) - int(AcceptorSite) - 1
-                                                                    x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
-                                                        elif Donor == Acceptor and "_RevStrand" not in Donor and fabs(int(DonorSite) - int(AcceptorSite) + 1) <= cfg.MicroInDel_Length:
-                                                            if int(DonorSite) - int(AcceptorSite) + 1 > 0:
-                                                                    #MicroInsertion
-                                                                    uCount += 1
-                                                                    DonorA = Donor
-                                                                    MicroInsContent = cfg.Genes[DonorA][int(AcceptorSite) - 1:int(DonorSite)]
-                                                                    NewAcceptorSite = str(int(DonorSite) + 1)
-                                                                    EventType, EventSize = "MicroInsertion", len(MicroInsContent)
-                                                                    AddInsToDict(Donor, DonorSite, NewAcceptorSite, MicroInsContent, uInsDicts, ReadName)
-                                                            elif int(DonorSite) - int(AcceptorSite) + 1 < 0:
-                                                                    #MicroDeletion
-                                                                    uCount += 1
-                                                                    EventType, EventSize = "MicroDeletion", int(AcceptorSite) - int(DonorSite) - 1
-                                                                    x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                                JumpSize = int(AcceptorSite) - int(DonorSite) - 1
+                                                        if Donor == Acceptor and 0 < JumpSize <= cfg.MicroInDel_Length:
+                                                                uCount += 1
+                                                                EventType, EventSize = "MicroDeletion", JumpSize
+                                                                x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
                                                         else:
-                                                                #Direct Recombination Event (reached via a small residual
-                                                                #junction instead of pixel-perfect adjacency)
+                                                                #Direct Recombination Event reached with an insert at the junction
                                                                 RecombCount += 1
                                                                 HasRealEvent = True
-                                                                if "_RevStrand" in Donor:
-                                                                    EventType, EventSize = "Recombination", int(DonorSite) - int(AcceptorSite) - 1
-                                                                else:
-                                                                    EventType, EventSize = "Recombination", int(AcceptorSite) - int(DonorSite) - 1
+                                                                EventType, EventSize = "Recombination", JumpSize
                                                                 x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
                                                                 if Donor in cfg.RefsLib1 and Acceptor in cfg.RefsLib1:
                                                                         ViralRecombinationCount +=1
@@ -1425,19 +1458,27 @@ def ResultsSort(File1):
                                                                         HostRecombinationCount += 1
                                                                 else:
                                                                         ViraltoHostRecombinationCount += 1
-                                                                #Also record the residual itself as its own MicroInsertion
-                                                                #rather than discarding it -- both are real, independently
-                                                                #informative signals for this junction.
+                                                        #Record the insert itself, whatever the junction turned out to be, so it is
+                                                        #visible both in Virus_Insertions.txt and as its own ordered row.
+                                                        if len(Insertion) >= cfg.MicroInDel_Length:
+                                                                InsCount += 1
+                                                                HasRealEvent = True
+                                                                AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, InsDicts, ReadName)
+                                                                ExtraEvent = ("Insertion", len(Insertion))
+                                                        else:
                                                                 uCount += 1
                                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, uInsDicts, ReadName)
-                                                    else:
-                                                        #Unknown Insertion.
+                                                                ExtraEvent = ("MicroInsertion", len(Insertion))
+                                                else:
+                                                        #Donor/Acceptor are not recognised reference names -- cannot be placed.
                                                         UnknownRecombinationCount += 1
                                                         HasRealEvent = True
                                                         EventType, EventSize = "UnknownInsertion", len(Insertion)
                                                         UnRec = 'Y'
                                 if EventType is not None:
                                     WriteReadEvent(ReadName, n+1, NSegments, EventType, Donor, DonorSite, Acceptor, AcceptorSite, EventSize)
+                                if ExtraEvent is not None:
+                                    WriteReadEvent(ReadName, n+1, NSegments, ExtraEvent[0], Donor, DonorSite, Acceptor, AcceptorSite, ExtraEvent[1])
                                 n+=1
                         if not HasRealEvent:
                                 #Every gap/event in this read fell within the MicroInDel_Length noise threshold --

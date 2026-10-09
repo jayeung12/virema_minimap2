@@ -883,9 +883,19 @@ def convert_to_virema_format():
                         if read[5] != '*':  # Only process reads with valid CIGAR
                             cigar_ops = re.findall(r'(\d+)([MIDNSHPX=])', read[5])
                             if len(cigar_ops) > 2:  # Only if internal operations possible
+                                # "Internal" means between two ALIGNMENT operations, so terminal
+                                # clips must not be counted as the bounding operations: a trailing
+                                # softclip sitting before a terminal hard clip is at the edge of
+                                # this record's alignment, not inside it, and rewriting it to an I
+                                # produces an insertion hanging off the end of the alignment --
+                                # invalid SAM, which samtools rejects, and which splits one insert
+                                # across two records so the compiler sees two adjacent unmapped
+                                # fields and mis-indexes every field after them.
+                                aligned_idx = [j for j, (_, op) in enumerate(cigar_ops)
+                                               if op not in 'SH']
                                 new_ops = []
                                 for j, (length, op) in enumerate(cigar_ops):
-                                    if op == 'S' and 0 < j < len(cigar_ops) - 1:
+                                    if op == 'S' and aligned_idx and aligned_idx[0] < j < aligned_idx[-1]:
                                         # Convert internal softclip to insertion
                                         new_ops.append(f"{length}I")
                                     else:
@@ -1044,7 +1054,7 @@ def group_contiguous_segments(segments):
     contiguous_groups.append(current_group)
     return contiguous_groups
 
-def create_single_merged_record_new(base_read_name, primary_read, segments):
+def create_single_merged_record_new(base_read_name, primary_read, segments, unplaced_fragments=None):
     """Create single merged record with N gaps for contiguous segments, using SAM-based accounting"""
     import re
 
@@ -1055,8 +1065,10 @@ def create_single_merged_record_new(base_read_name, primary_read, segments):
     merged_cigar_parts = []
     merged_ref_pos = segments[0]['ref_pos']
     merged_ref_name = segments[0]['ref_name']
+    segment_starts = []  # index in merged_cigar_parts where each segment's own ops begin
 
     for i, segment in enumerate(segments):
+        segment_starts.append(len(merged_cigar_parts))
         is_first_segment = (i == 0)
         is_last_segment = (i == len(segments) - 1)
 
@@ -1079,6 +1091,37 @@ def create_single_merged_record_new(base_read_name, primary_read, segments):
             aligned_ops = extract_aligned_operations(segment['cigar'], accounted_positions, is_first_segment, is_last_segment)
             merged_cigar_parts.extend(aligned_ops)
             last_end_pos = calculate_genomic_end_position(segment['ref_pos'], segment['cigar'])
+
+    # Same read-length reconciliation as create_paired_records_new(): a fragment whose
+    # realignment failed contributes no operations, so without this the record claims fewer query
+    # bases than the read has and SEQ stops matching CIGAR. There are no hard clips here (one
+    # record covers the whole read), so the two must agree exactly. A residual landing between
+    # two aligned blocks is emitted as a soft clip and then rewritten to an insertion by the
+    # internal-softclip pass in convert_to_virema_format(), which is what it is.
+    full_read_length = len(primary_read[9]) if primary_read[9] not in ('', '*') else 0
+    if full_read_length:
+        accounted = sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', ''.join(merged_cigar_parts)))
+        residual = full_read_length - accounted
+        if residual > 0:
+            insert_at = len(merged_cigar_parts)
+            if unplaced_fragments:
+                fragment_position = max(unplaced_fragments, key=lambda item: item[1])[0]
+                preceding = sum(1 for seg in segments if seg['seq_pos'] < fragment_position)
+                if preceding < len(segment_starts):
+                    insert_at = segment_starts[preceding]
+            merged_cigar_parts.insert(insert_at, f"{residual}S")
+        elif residual < 0:
+            deficit = -residual
+            for j in range(len(merged_cigar_parts) - 1, -1, -1):
+                if deficit <= 0:
+                    break
+                match = re.fullmatch(r'(\d+)S', merged_cigar_parts[j])
+                if match:
+                    have = int(match.group(1))
+                    take = min(have, deficit)
+                    deficit -= take
+                    merged_cigar_parts[j] = f"{have - take}S" if have > take else ''
+            merged_cigar_parts = [part for part in merged_cigar_parts if part]
 
     # Create merged record
     merged_read = primary_read.copy()
@@ -1154,7 +1197,7 @@ def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_firs
 
     return aligned_ops
 
-def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
+def create_paired_records_new(base_read_name, primary_read, contiguous_groups, unplaced_fragments=None):
     """Create paired records from multiple contiguous groups using SAM-based accounting"""
     records = []
 
@@ -1206,6 +1249,61 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups):
             'ref_name': group_ref_name,
             'strand': _segment_strand(group[0]),
         })
+
+    # Reconcile the read's full length against what the groups actually account for.
+    #
+    # A fragment whose own realignment failed is not in any group, and the segment that would
+    # have carried its bases as a soft clip can be removed by _dedupe_redundant_segments() in
+    # favour of an equivalent record that HARD-clips them instead -- hard clips carry no
+    # obligation to be represented, so those bases disappear from the read's coordinate system
+    # entirely. The hard clips below are derived from the groups' own query lengths, so the
+    # resulting records then describe a shorter read than the one that was sequenced, and SEQ no
+    # longer matches the CIGAR. Emit whatever is missing as an explicit soft clip at the
+    # boundary the failed fragment sits at, so every base of the read is accounted for exactly
+    # once and the insert survives into the compiler (which treats a soft clip between two
+    # mapped segments as an insertion, the same as an I operation).
+    full_read_length = len(primary_read[9]) if primary_read[9] not in ('', '*') else 0
+    if full_read_length and len(processed_groups) > 1:
+        accounted = sum(
+            sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', ''.join(g['cigar_parts'])))
+            for g in processed_groups)
+        residual = full_read_length - accounted
+        if residual > 0:
+            # Place it against the group it sits next to in the read. The failed fragment's own
+            # position scalar (from its softclip path) says where in the read it came from, so
+            # count how many groups precede it: 0 means it precedes every mapped block and
+            # belongs at the front of the first record, otherwise it trails that many-th group.
+            group_positions = [max(seg['seq_pos'] for seg in group) for group in contiguous_groups]
+            if unplaced_fragments:
+                fragment_position = max(unplaced_fragments, key=lambda item: item[1])[0]
+                preceding = sum(1 for pos in group_positions if pos < fragment_position)
+            else:
+                preceding = len(processed_groups)
+            if preceding == 0:
+                processed_groups[0]['cigar_parts'].insert(0, f"{residual}S")
+            else:
+                target = min(preceding, len(processed_groups)) - 1
+                processed_groups[target]['cigar_parts'].append(f"{residual}S")
+        elif residual < 0:
+            # The groups claim MORE query bases than the read has, which happens on some
+            # reverse-strand reads where a clip is emitted in the wrong frame and so gets
+            # counted twice. Those bases do not exist, so trim the excess off soft clips
+            # (last first) rather than leave SEQ and CIGAR disagreeing.
+            deficit = -residual
+            for group in reversed(processed_groups):
+                parts = group['cigar_parts']
+                for j in range(len(parts) - 1, -1, -1):
+                    if deficit <= 0:
+                        break
+                    match = re.fullmatch(r'(\d+)S', parts[j])
+                    if match:
+                        have = int(match.group(1))
+                        take = min(have, deficit)
+                        deficit -= take
+                        parts[j] = f"{have - take}S" if have > take else ''
+                group['cigar_parts'] = [part for part in parts if part]
+                if deficit <= 0:
+                    break
 
     # Now build records with correct hard clips calculated from processed operations
     for group_idx, processed_group in enumerate(processed_groups):
@@ -1559,6 +1657,12 @@ def merge_split_alignments(base_read_name, reads):
     primary_read = None
     primary_candidates = []
     softclip_reads = {}  # sequence_position -> list of reads at that position (usually 1)
+    # Softclip fragments that never aligned anywhere. Their bases are still part of the read
+    # (foreign sequence, host sequence with no host index, a co-infecting virus), so they are
+    # kept here with their position in the read and reconciled back into the merged CIGAR by
+    # create_paired_records_new(). Previously they were simply dropped, which silently removed
+    # them from the read's coordinate system and from every downstream report.
+    unplaced_fragments = []  # (sequence_position, length)
 
     for read in reads:
         read_name = read[0]
@@ -1569,6 +1673,8 @@ def merge_split_alignments(base_read_name, reads):
             sequence_position = get_sequence_position_for_read(read_name, base_read_name, None)
             if sequence_position is not None and flag & 4 == 0:  # Only if aligned
                 softclip_reads.setdefault(sequence_position, []).append(read)
+            elif sequence_position is not None and (flag & 4) and read[9] not in ('', '*'):
+                unplaced_fragments.append((sequence_position, len(read[9])))
         elif not (flag & 4) and not (flag & 2048):  # Primary alignment candidate
             primary_candidates.append(read)
 
@@ -1655,7 +1761,9 @@ def merge_split_alignments(base_read_name, reads):
     # Step 5: Output generation
     if len(contiguous_groups) == 1:
         # Single merged record
-        return create_single_merged_record_new(base_read_name, primary_read, contiguous_groups[0])
+        return create_single_merged_record_new(base_read_name, primary_read, contiguous_groups[0],
+                                              unplaced_fragments)
     else:
         # Paired records
-        return create_paired_records_new(base_read_name, primary_read, contiguous_groups)
+        return create_paired_records_new(base_read_name, primary_read, contiguous_groups,
+                                        unplaced_fragments)
