@@ -160,20 +160,39 @@ methodology and numbers.
   `segment_index` -- the junction, classified by its own jump size exactly as a clean junction
   is, and the insert -- and the sequence goes to `Virus_Insertions.txt` keyed on the same
   donor/acceptor pair. No new event categories. Measured on the full SRR34426338 library
-  (145,547 reads): 4,722 insert rows at the cassette junction with a **median size of 577**, the
-  cassette's exact length, and every sampled recorded sequence aligns to it; the 3,312 reads
-  carrying the junction still report it; rows with raw sequence in the acceptor-reference column
-  went 607 -> 0; records whose `SEQ` disagreed with their `CIGAR` went 16,531 -> 92 of 162,712;
-  "Unknown or Ambiguous Recombination Events" went 10,240 -> 0. On the bundled FHV short-read
-  test data a 979nt deletion carrying a 13nt insert was previously discarded entirely and is now
-  reported -- the only change to that dataset's results, and its SAM stays byte-identical. On
-  SRR37793484 (HiFi) the 31 "Unknown or Ambiguous" events became 31 recombinations plus 32
-  insertions, and invalid records went 4 -> 1.
+  (145,547 reads): 5,125 insert rows at the cassette junction with a **median size of 578**
+  against the cassette's 577nt (range 23-1801), and all 400 sampled sequences align to the
+  reconstructed reporter, covering a mean 91.6% of each insert; the 5,157 junction rows at that
+  locus are still reported; rows with raw sequence in the acceptor-reference column went
+  607 -> 0; records whose `SEQ` disagreed with their `CIGAR` went 18,765 -> 2,326 of 164,946
+  (11.38% -> 1.41%); "Unknown or Ambiguous Recombination Events" went 10,240 -> 0. On the
+  bundled FHV_10k test data the 17 reads whose junction carried an insert were previously
+  discarded as `UnknownInsertion` and are now reported as a junction plus an insert
+  (+17 Recombination, +3 Insertion, +14 MicroInsertion; 2,371 -> 2,388 rows), the only change to
+  that dataset, and its SAM stays byte-identical. On SRR37793484 (HiFi, against NC_045512.2) the
+  31 "Unknown or Ambiguous" events became 32 recombinations plus 32 insertions and 2 micro-
+  insertions, and invalid records went 10 -> 5 of 1,734.
 
-  **Not fixed by this change**: the residual 92 records (and that 1 HiFi read) are a separate
-  pre-existing defect in which two groups claim the same query bases, so the CIGAR over-claims
-  the read and there is no soft clip left to trim against. samtools therefore still refuses the
-  full SRR34426338 output, though at 0.06% of records rather than 10.2%.
+  **Not fixed by this change**: the residual invalid records are a separate pre-existing defect
+  in which two groups claim the same query bases, so the CIGAR over-claims the read and there is
+  no soft clip left to trim against. samtools therefore still refuses these outputs, on
+  SRR34426338 at 1.41% of records rather than 11.38%.
+
+  **Nondeterminism, pre-existing**: `Virus_Conservation.bedgraph` and
+  `Virus_Duplications.bedgraph` differ between two runs of identical code, because the plotting
+  pass iterates a set of reference names. They are reproducible under `PYTHONHASHSEED=0`, which
+  is what the comparisons above use; the event tables and the other BED files are unaffected.
+  Also guarded: an insertion's dict entry is keyed on the flanks it sits between, which used to
+  be adjacent by construction -- that is what makes its BED interval one base wide and the
+  `Ins:` name reachable. An insert at a junction carries that junction's flanks instead, so
+  without a guard it emits a second, duplicate copy of the row the junction already wrote, and a
+  junction-wide span in the MicroRecombinations file. The insertion BED writes now require the
+  same adjacency that the `Ins:` name requires -- `Stop == Start +/- 1` by direction, not merely
+  `|Stop - Start| == 1`, since a one-base overlap is named `Duplication` and would still
+  collide. The junction's own row covers the interval and the sequence stays in the insertions
+  files and `Read_Events.tsv`. This also removes 539 duplicate rows that SRR34426338 produced
+  before the change.
+
   Also guarded: the single-interval BED writes name ONE reference but were handed the acceptor
   coordinate of cross-segment junctions, which indexes past the end of the coverage array in
   `BEDGraph_Plot()`. Previously unreachable because those events were being discarded; the guard

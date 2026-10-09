@@ -1009,19 +1009,40 @@ def ResultsSort(File1):
                         RefLength = len(cfg.Genes.get(Genes[0], ''))
                         SingleIntervalOK = (len(Genes) < 2 or Genes[0] == Genes[1]) and (
                             RefLength == 0 or (int(Entry[0]) <= RefLength and int(Entry[2]) <= RefLength))
+                        #An insertion dict entry is keyed on the flanks the insert sits between.
+                        #Those used to be adjacent by construction, which is what makes the
+                        #interval below one base wide and the 'Ins:' name above reachable. An
+                        #insert at a recombination junction carries that JUNCTION's flanks
+                        #instead, so the interval would span the whole junction and be named by
+                        #its coordinates -- a second, duplicate copy of the row the junction
+                        #already wrote from RecDicts, and in the uIns case a junction-wide span
+                        #in the MicroRecombinations file. The junction's own row covers the
+                        #interval; the inserted sequence is kept in the Virus_*Insertions.txt
+                        #files and in Read_Events.tsv, so skip the redundant interval here.
+                        #This has to be the SAME condition that makes the 'Ins:' name reachable
+                        #above, not merely |Stop - Start| == 1: a one-base OVERLAP is adjacent by
+                        #that looser test but is named 'Duplication', so it would still collide
+                        #with the junction's own row.
+                        FlanksAdjacent = (Stop == Start + 1) if Dir == '+' else (Stop == Start - 1)
                         if TargetFile == VirusRecs and SingleIntervalOK:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusRecs_BED.write(BED_OUTPUT + "\n")
-                        elif TargetFile == VirusInsertions and SingleIntervalOK:
+                        elif TargetFile == VirusInsertions and SingleIntervalOK and FlanksAdjacent:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             VirusRecs_BED.write(BED_OUTPUT + "\n")
-                        elif (TargetFile == VirusuIns or TargetFile == VirusuDels) and SingleIntervalOK:
+                        elif TargetFile == VirusuIns and SingleIntervalOK and FlanksAdjacent:
+                            BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
+                            if cfg.PseudoRef:
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
+                                BED_OUTPUT += PseudoRef
+                            VirusuRecs_BED.write(BED_OUTPUT + "\n")
+                        elif TargetFile == VirusuDels and SingleIntervalOK:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
@@ -1033,7 +1054,13 @@ def ResultsSort(File1):
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
                                 BED_OUTPUT += PseudoRef
                             HostRecs_BED.write(BED_OUTPUT + "\n")
-                        elif TargetFile == HostuIns or TargetFile == HostuDels:
+                        elif TargetFile == HostuIns and FlanksAdjacent:
+                            BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
+                            if cfg.PseudoRef:
+                                PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
+                                BED_OUTPUT += PseudoRef
+                            HostuRecs_BED.write(BED_OUTPUT + "\n")
+                        elif TargetFile == HostuDels:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
                             if cfg.PseudoRef:
                                 PseudoRef = "\t" + PseudoLeftSeq + PseudoRightSeq
