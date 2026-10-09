@@ -1469,10 +1469,31 @@ def ResultsSort(File1):
                                                                 JumpSize = int(DonorSite) - int(AcceptorSite) - 1
                                                         else:
                                                                 JumpSize = int(AcceptorSite) - int(DonorSite) - 1
-                                                        if Donor == Acceptor and 0 < JumpSize <= cfg.MicroInDel_Length:
-                                                                uCount += 1
-                                                                EventType, EventSize = "MicroDeletion", JumpSize
-                                                                x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                        #A small jump EITHER WAY is a micro-event, not a recombination. Testing
+                                                        #only 0 < JumpSize caught deletions but promoted the overlap geometry
+                                                        #(JumpSize < 0, flanks overlapping by a few bases) to Recombination,
+                                                        #which is what the pre-existing code classified as a MicroInsertion via
+                                                        #fabs(). Benchmark ground truth showed that promotion producing calls
+                                                        #like "27919 -> 27919 size=-1" -- a one-base overlap reported as a
+                                                        #junction. Mirror the original fabs() test, including its reference-
+                                                        #derived content for the duplicated span, so only a jump that really
+                                                        #exceeds the noise threshold becomes a Recombination.
+                                                        if Donor == Acceptor and fabs(JumpSize) <= cfg.MicroInDel_Length:
+                                                                if JumpSize > 0:
+                                                                        uCount += 1
+                                                                        EventType, EventSize = "MicroDeletion", JumpSize
+                                                                        x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                                elif JumpSize < 0:
+                                                                        uCount += 1
+                                                                        DonorA = Donor[:-10] if "_RevStrand" in Donor else Donor
+                                                                        if "_RevStrand" in Donor:
+                                                                                MicroInsContent = Rev_Comp(cfg.Genes[DonorA][int(DonorSite) - 1:int(AcceptorSite)])
+                                                                                NewAcceptorSite = str(int(DonorSite) - 1)
+                                                                        else:
+                                                                                MicroInsContent = cfg.Genes[DonorA][int(AcceptorSite) - 1:int(DonorSite)]
+                                                                                NewAcceptorSite = str(int(DonorSite) + 1)
+                                                                        EventType, EventSize = "MicroInsertion", len(MicroInsContent)
+                                                                        AddInsToDict(Donor, DonorSite, NewAcceptorSite, MicroInsContent, uInsDicts, ReadName)
                                                         else:
                                                                 #Direct Recombination Event reached with an insert at the junction
                                                                 RecombCount += 1
