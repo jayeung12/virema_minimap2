@@ -1054,6 +1054,28 @@ def group_contiguous_segments(segments):
     contiguous_groups.append(current_group)
     return contiguous_groups
 
+def coalesce_cigar_ops(cigar):
+    """Merge adjacent operations of the same type into one.
+
+    The compiler consumes at most ONE leading soft clip before it starts walking the CIGAR
+    (RecreateOldFormatfromSAM handles it with an `if`, not a `while`); a second adjacent clip
+    falls into the main loop, where the S branch does `CurrentNt += length` and so advances the
+    reference cursor. Two adjacent clips therefore shift every coordinate on that record
+    downstream by the length of the second one. Residual reconciliation can insert a soft clip
+    next to one that is already there, so normalise before emitting.
+    """
+    ops = re.findall(r'(\d+)([MIDNSHPX=])', cigar)
+    if not ops:
+        return cigar
+    merged = [[int(ops[0][0]), ops[0][1]]]
+    for length, op in ops[1:]:
+        if op == merged[-1][1]:
+            merged[-1][0] += int(length)
+        else:
+            merged.append([int(length), op])
+    return ''.join(f"{length}{op}" for length, op in merged)
+
+
 def create_single_merged_record_new(base_read_name, primary_read, segments, unplaced_fragments=None):
     """Create single merged record with N gaps for contiguous segments, using SAM-based accounting"""
     import re
@@ -1133,7 +1155,7 @@ def create_single_merged_record_new(base_read_name, primary_read, segments, unpl
     merged_read[2] = merged_ref_name
     merged_read[3] = str(merged_ref_pos)
     merged_read[4] = '255'  # High MAPQ
-    merged_read[5] = ''.join(merged_cigar_parts)
+    merged_read[5] = coalesce_cigar_ops(''.join(merged_cigar_parts))
 
     # Keep essential tags
     essential_tags = []
@@ -1346,7 +1368,7 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
         if following_groups_length > 0:
             cigar_parts.append(f"{following_groups_length}H")
 
-        record[5] = ''.join(cigar_parts)
+        record[5] = coalesce_cigar_ops(''.join(cigar_parts))
 
         # Set mate information for paired records
         if len(processed_groups) > 1:
