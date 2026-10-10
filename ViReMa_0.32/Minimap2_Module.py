@@ -1076,6 +1076,43 @@ def coalesce_cigar_ops(cigar):
     return ''.join(f"{length}{op}" for length, op in merged)
 
 
+def apportion_residual(residual, fragments, slot_of):
+    """Split an unaccounted stretch of read length across the fragments that caused it.
+
+    `fragments` are (sequence_position, length) pairs for fragments whose own realignment
+    failed; `slot_of` maps one fragment's position in the read to the emit point its bases
+    belong at. Previously the whole residual was placed at the position of the single LONGEST
+    fragment, so a read with two failed stretches had the second one's bases appended to the
+    first one's junction -- the insert reported there was the sum of both, at the wrong place.
+    The residual rarely equals the sum of the fragment lengths exactly (clips can be deduped or
+    double-counted upstream), so apportion it by length rather than assuming it does, and give
+    the rounding remainder to the longest stretch. With a single stretch this returns the whole
+    residual at that one slot, exactly as before.
+    """
+    if not fragments:
+        return {}
+    totals = {}
+    for position, length in fragments:
+        slot = slot_of(position)
+        totals[slot] = totals.get(slot, 0) + length
+    if len(totals) == 1:
+        return {next(iter(totals)): residual}
+    grand = sum(totals.values())
+    if grand <= 0:
+        return {max(totals): residual}
+    shares = {}
+    assigned = 0
+    for slot, length in totals.items():
+        share = residual * length // grand
+        shares[slot] = share
+        assigned += share
+    leftover = residual - assigned
+    if leftover:
+        # max() ties break on the first slot encountered, which is insertion-ordered and so
+        # deterministic across runs.
+        shares[max(totals, key=lambda slot: totals[slot])] += leftover
+    return {slot: share for slot, share in shares.items() if share > 0}
+
 def create_single_merged_record_new(base_read_name, primary_read, segments, unplaced_fragments=None):
     """Create single merged record with N gaps for contiguous segments, using SAM-based accounting"""
     import re
@@ -1125,13 +1162,18 @@ def create_single_merged_record_new(base_read_name, primary_read, segments, unpl
         accounted = sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', ''.join(merged_cigar_parts)))
         residual = full_read_length - accounted
         if residual > 0:
-            insert_at = len(merged_cigar_parts)
-            if unplaced_fragments:
-                fragment_position = max(unplaced_fragments, key=lambda item: item[1])[0]
-                preceding = sum(1 for seg in segments if seg['seq_pos'] < fragment_position)
+            shares = apportion_residual(
+                residual, unplaced_fragments,
+                lambda position: sum(1 for seg in segments if seg['seq_pos'] < position))
+            if not shares:
+                shares = {len(segment_starts): residual}
+            # Descending, so inserting one clip cannot shift the index another one still needs.
+            for preceding in sorted(shares, reverse=True):
                 if preceding < len(segment_starts):
                     insert_at = segment_starts[preceding]
-            merged_cigar_parts.insert(insert_at, f"{residual}S")
+                else:
+                    insert_at = len(merged_cigar_parts)
+                merged_cigar_parts.insert(insert_at, f"{shares[preceding]}S")
         elif residual < 0:
             deficit = -residual
             for j in range(len(merged_cigar_parts) - 1, -1, -1):
@@ -1296,16 +1338,17 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
             # count how many groups precede it: 0 means it precedes every mapped block and
             # belongs at the front of the first record, otherwise it trails that many-th group.
             group_positions = [max(seg['seq_pos'] for seg in group) for group in contiguous_groups]
-            if unplaced_fragments:
-                fragment_position = max(unplaced_fragments, key=lambda item: item[1])[0]
-                preceding = sum(1 for pos in group_positions if pos < fragment_position)
-            else:
-                preceding = len(processed_groups)
-            if preceding == 0:
-                processed_groups[0]['cigar_parts'].insert(0, f"{residual}S")
-            else:
-                target = min(preceding, len(processed_groups)) - 1
-                processed_groups[target]['cigar_parts'].append(f"{residual}S")
+            shares = apportion_residual(
+                residual, unplaced_fragments,
+                lambda position: sum(1 for pos in group_positions if pos < position))
+            if not shares:
+                shares = {len(processed_groups): residual}
+            for preceding, share in shares.items():
+                if preceding == 0:
+                    processed_groups[0]['cigar_parts'].insert(0, f"{share}S")
+                else:
+                    target = min(preceding, len(processed_groups)) - 1
+                    processed_groups[target]['cigar_parts'].append(f"{share}S")
         elif residual < 0:
             # The groups claim MORE query bases than the read has, which happens on some
             # reverse-strand reads where a clip is emitted in the wrong frame and so gets
