@@ -1076,6 +1076,62 @@ def coalesce_cigar_ops(cigar):
     return ''.join(f"{length}{op}" for length, op in merged)
 
 
+def _trim_cigar_parts_at_edge(parts, bases, from_start):
+    """Trim `bases` query bases off one END of a built-up CIGAR part list.
+
+    Returns (new_parts, query_bases_removed, reference_bases_removed). Used only as a last
+    resort, when the records still claim more query bases than the read has after every soft
+    clip has been given back -- an unaccounted soft clip re-claiming bases another segment
+    already aligned, which the query-overlap pass cannot see because the accounting that
+    promotes that clip to an insertion happens later.
+
+    Only ever applied at the OUTER edges of a read (the first record's start, the last
+    record's end). Those are the read's own termini, never a junction: every event the
+    compiler reports sits at a boundary BETWEEN two blocks, so removing bases here leaves
+    every donor and acceptor coordinate exactly where it was, and only shortens how much of
+    the read's own ends are covered.
+    """
+    ops = []
+    for part in parts:
+        ops.extend([int(length), op] for length, op in re.findall(r'(\d+)([MIDNSHPX=])', part))
+    if not ops or bases <= 0:
+        return parts, 0, 0
+    if not from_start:
+        ops.reverse()
+
+    remaining = bases
+    removed_query = 0
+    removed_ref = 0
+    index = 0
+    while index < len(ops) and ops[index][1] == 'H':
+        index += 1
+    while index < len(ops) and remaining > 0:
+        length, op = ops[index]
+        if op in 'MIS=X':
+            taken = min(length, remaining)
+            remaining -= taken
+            removed_query += taken
+            if op in 'M=X':
+                removed_ref += taken
+            ops[index][0] = length - taken
+            if ops[index][0] == 0:
+                index += 1
+        else:
+            if op in 'DN':
+                removed_ref += length
+            ops[index][0] = 0
+            index += 1
+    while index < len(ops) and ops[index][1] in 'DNP':
+        if ops[index][1] in 'DN':
+            removed_ref += ops[index][0]
+        ops[index][0] = 0
+        index += 1
+
+    kept = [[length, op] for length, op in ops if length > 0]
+    if not from_start:
+        kept.reverse()
+    return [f'{length}{op}' for length, op in kept], removed_query, removed_ref
+
 def apportion_residual(residual, fragments, slot_of):
     """Split an unaccounted stretch of read length across the fragments that caused it.
 
@@ -1186,6 +1242,17 @@ def create_single_merged_record_new(base_read_name, primary_read, segments, unpl
                     deficit -= take
                     merged_cigar_parts[j] = f"{have - take}S" if have > take else ''
             merged_cigar_parts = [part for part in merged_cigar_parts if part]
+            if deficit > 0:
+                # Nothing left to give back as a clip: take it off the read's own ends, which
+                # carry no junction (see _trim_cigar_parts_at_edge).
+                merged_cigar_parts, taken, _ = _trim_cigar_parts_at_edge(
+                    merged_cigar_parts, deficit, from_start=False)
+                deficit -= taken
+            if deficit > 0:
+                merged_cigar_parts, taken, ref_removed = _trim_cigar_parts_at_edge(
+                    merged_cigar_parts, deficit, from_start=True)
+                merged_ref_pos += ref_removed
+                deficit -= taken
 
     # Create merged record
     merged_read = primary_read.copy()
@@ -1369,6 +1436,17 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
                 group['cigar_parts'] = [part for part in parts if part]
                 if deficit <= 0:
                     break
+            if deficit > 0:
+                last = processed_groups[-1]
+                last['cigar_parts'], taken, _ = _trim_cigar_parts_at_edge(
+                    last['cigar_parts'], deficit, from_start=False)
+                deficit -= taken
+            if deficit > 0:
+                first = processed_groups[0]
+                first['cigar_parts'], taken, ref_removed = _trim_cigar_parts_at_edge(
+                    first['cigar_parts'], deficit, from_start=True)
+                first['ref_pos'] += ref_removed
+                deficit -= taken
 
     # Now build records with correct hard clips calculated from processed operations
     for group_idx, processed_group in enumerate(processed_groups):
@@ -1707,6 +1785,219 @@ def _dedupe_redundant_segments(segments):
     return kept
 
 
+_COMPLEMENT = str.maketrans('ACGTNacgtn', 'TGCANtgcan')
+
+
+def _rev_comp(sequence):
+    return sequence.translate(_COMPLEMENT)[::-1]
+
+
+def _query_interval_in_read(read_fields, read_sequence):
+    """Where this record's ALIGNED block sits in the base read's own coordinates.
+
+    Returns (start, end) as offsets into `read_sequence`, or None when it cannot be placed.
+
+    Nothing in the SAM states this directly: each record's CIGAR and SEQ are expressed in its
+    own frame (a softclip fragment's frame, possibly reverse-complemented, possibly with the
+    unaligned flanks hard-clipped away so they are missing from SEQ entirely). But every
+    fragment's SEQ is by construction a substring of the base read, so locating it gives the
+    frame's offset exactly; `_true_query_start` then gives the aligned block's offset within
+    that frame in the read's own orientation. Fragments are hundreds of bases long, so the
+    match is unique in practice -- a sequence that occurs more than once, or not at all, gives
+    up rather than guessing.
+    """
+    sequence = read_fields[9]
+    if not read_sequence or sequence in ('', '*'):
+        return None
+    ops = re.findall(r'(\d+)([MIDNSHPX=])', read_fields[5])
+    if not ops:
+        return None
+
+    def edge_clip(sequence_ops, letters):
+        total = 0
+        for length, op in sequence_ops:
+            if op in letters:
+                total += int(length)
+            else:
+                break
+        return total
+
+    lead_soft = edge_clip(ops, 'S')
+    trail_soft = edge_clip(list(reversed(ops)), 'S')
+    lead_any = edge_clip(ops, 'SH')
+    trail_any = edge_clip(list(reversed(ops)), 'SH')
+    hard_total = (lead_any - lead_soft) + (trail_any - trail_soft)
+    query_length = sum(int(length) for length, op in ops if op in 'MIS=X')
+
+    # A hard clip's bases are absent from SEQ, so the located substring starts at the aligned
+    # block's own soft clip. But _clip_side_to_hardclip() rewrites an S as an H without
+    # touching SEQ, and for those records the clipped bases ARE still in SEQ and have to be
+    # stepped over. Tell the two apart by what SEQ's length agrees with; anything else is a
+    # record whose SEQ and CIGAR already disagree, which cannot be placed at all.
+    if len(sequence) == query_length:
+        lead, trail = lead_soft, trail_soft
+    elif len(sequence) == query_length + hard_total:
+        lead, trail = lead_any, trail_any
+    else:
+        return None
+
+    # Orientation is relative to the frame `read_sequence` is written in, not to the original
+    # read: when the primary itself is reverse-strand, a reverse-strand fragment sits in the
+    # SAME frame as it and needs no flip. Rather than track whose strand is whose, try both and
+    # take the one that actually occurs. A record whose SEQ is reverse-complemented relative to
+    # the base frame has its own leading clip at the base frame's right-hand end, so its
+    # aligned block starts at its own TRAILING clip there.
+    for flipped in (False, True):
+        oriented = _rev_comp(sequence) if flipped else sequence
+        if read_sequence.count(oriented) != 1:
+            continue
+        start = read_sequence.find(oriented) + (trail if flipped else lead)
+        return start, start + _aligned_query_len(read_fields[5])
+    return None
+
+
+def _trim_query_side(read_fields, bases, own_frame_side):
+    """Take `bases` query bases off one end of this record's aligned block.
+
+    The removed bases become a hard clip, so extract_aligned_operations() stops counting them
+    towards the read's query length (it ignores H). Trimming the record's own LEADING side also
+    moves where it starts on the reference, so POS advances by the reference bases removed,
+    including any deletion/skip left stranded at the new edge.
+    """
+    ops = [[int(length), op] for length, op in re.findall(r'(\d+)([MIDNSHPX=])', read_fields[5])]
+    if not ops or bases <= 0:
+        return read_fields
+    leading = own_frame_side == 'leading'
+    if not leading:
+        ops.reverse()
+
+    remaining = bases
+    hard = 0
+    ref_removed = 0
+    index = 0
+    while index < len(ops) and ops[index][1] == 'H':
+        hard += ops[index][0]
+        index += 1
+    while index < len(ops) and remaining > 0:
+        length, op = ops[index]
+        if op in 'MIS=X':
+            taken = min(length, remaining)
+            remaining -= taken
+            hard += taken
+            if op in 'M=X':
+                ref_removed += taken
+            ops[index][0] = length - taken
+            if ops[index][0] == 0:
+                index += 1
+        else:
+            # D/N/P consume reference only, so they cannot absorb any of the trim; one sitting
+            # inside the trimmed stretch simply goes away.
+            if op in 'DN':
+                ref_removed += length
+            ops[index][0] = 0
+            index += 1
+    # A deletion or skip left at the new edge is not a legal start/end for an alignment.
+    while index < len(ops) and ops[index][1] in 'DNP':
+        if ops[index][1] in 'DN':
+            ref_removed += ops[index][0]
+        ops[index][0] = 0
+        index += 1
+
+    kept = [[length, op] for length, op in ops if length > 0 and op != 'H']
+    if not any(op in 'MI=X' for _, op in kept):
+        return None  # nothing aligned survives
+    if hard:
+        kept.insert(0, [hard, 'H'])
+    if not leading:
+        kept.reverse()
+
+    trimmed = list(read_fields)
+    trimmed[5] = ''.join(f'{length}{op}' for length, op in kept)
+    if leading and ref_removed:
+        trimmed[3] = str(int(trimmed[3]) + ref_removed)
+    return trimmed
+
+
+def _resolve_query_overlaps(segments, read_sequence):
+    """Make the segments' claims on the read disjoint.
+
+    minimap2 reports a chimeric alignment as a primary plus supplementary records whose QUERY
+    ranges may overlap -- the bases either side of a junction that both ends can explain are
+    attributed to both of them. The merge path adds up each group's query length to derive the
+    hard clips that then slice SEQ, so an overlap makes the record set claim more bases than the
+    read has: CIGAR and SEQ disagree and samtools rejects the output ("CIGAR and query sequence
+    are of different length"). Measured at 1.4% of records on a 145k-read ONT library; one read
+    there had three blocks claiming 8,790 bases of an 8,144 nt read, over by exactly the 646 nt
+    two of them shared.
+
+    Each contested base goes to the better-scoring alignment and is hard-clipped off the other,
+    so the blocks partition the read and the clips derived from them are right. Note what this
+    does NOT settle: where inside the contested stretch the junction truly lies is not
+    recoverable from the alignments -- both ends explain those bases. Picking the better-scoring
+    alignment picks one end of that window, so a junction's reported coordinates can sit up to
+    the overlap's length away from another equally-consistent placement.
+
+    Runs to a fixpoint rather than one pass, so that a block sitting entirely INSIDE another
+    (trimming one edge cannot separate those) is resolved too -- there the contained block is
+    always the one that gives way, since the alternative would be splitting its container in
+    two. Every step removes at least one base from some claim, so this terminates.
+    """
+    if not read_sequence:
+        return segments
+
+    placed = [[segment, _query_interval_in_read(segment['read'], read_sequence)]
+              for segment in segments]
+
+    def sort_key(item):
+        return (item[1] is None, item[1] or (0, 0))
+
+    for _ in range(len(placed) * len(placed) + 1):
+        placed.sort(key=sort_key)
+        conflict = None
+        for i in range(len(placed) - 1):
+            if placed[i][1] is None:
+                continue
+            for j in range(i + 1, len(placed)):
+                if placed[j][1] is None:
+                    continue
+                left, right = placed[i][1], placed[j][1]
+                overlap = min(left[1], right[1]) - max(left[0], right[0])
+                if overlap > 0:
+                    conflict = (i, j, overlap)
+                # placed is sorted by start, so once one j clears i every later one does too
+                break
+            if conflict:
+                break
+        if conflict is None:
+            return [segment for segment, _ in placed if segment is not None]
+
+        i, j, overlap = conflict
+        left, right = placed[i][1], placed[j][1]
+        if right[1] <= left[1]:
+            # Contained: only the inner block can give way.
+            loser, true_side = j, 'leading'
+        elif (get_as_score_from_read_fields(placed[i][0]['read'])
+              < get_as_score_from_read_fields(placed[j][0]['read'])):
+            loser, true_side = i, 'trailing'
+        else:
+            loser, true_side = j, 'leading'
+
+        target = placed[loser][0]
+        trimmed = _trim_query_side(
+            target['read'], overlap,
+            _own_frame_side_for_true_side(int(target['read'][1]), true_side))
+        if trimmed is None:
+            placed[loser] = [None, None]
+            continue
+        target['read'] = trimmed
+        target['cigar'] = trimmed[5]
+        target['ref_pos'] = int(trimmed[3])
+        own = placed[loser][1]
+        placed[loser][1] = ((own[0] + overlap, own[1]) if true_side == 'leading'
+                            else (own[0], own[1] - overlap))
+
+    return [segment for segment, _ in placed if segment is not None]
+
 def merge_split_alignments(base_read_name, reads):
     """Merge multiple alignment records using softclip merging logic"""
     import re
@@ -1816,6 +2107,11 @@ def merge_split_alignments(base_read_name, reads):
     # (they come from different softclip identifiers/positions, so nothing earlier catches
     # this). Only applied to genuinely high-overlap pairs; low/partial overlap is left alone.
     segments = _dedupe_redundant_segments(segments)
+
+    # Step 2c: Two records of one chimeric alignment can claim the same query bases (the
+    # junction's ambiguous region). Resolve that before any arithmetic is derived from their
+    # query lengths -- see _resolve_query_overlaps.
+    segments = _resolve_query_overlaps(segments, primary_read[9] if primary_read[9] not in ('', '*') else '')
 
     # Step 3: Sequence ordering - sort by sequence position
     segments.sort(key=lambda x: x['seq_pos'])
