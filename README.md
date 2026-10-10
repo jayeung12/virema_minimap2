@@ -37,7 +37,7 @@ classification during compilation.
 
 ### 1. Initial Alignment
 - **Tool**: Minimap2 with technology-specific parameters:
-  - **Short reads (default)**: `-ax sr -k 20 -A 1 -B 2`
+  - **Short reads (default)**: `-ax sr -k 20 -A 1 -B 2 -O 2,8 -g 2000 -z 800,400 -n 1 -p 0.3 -N 3 -s 20 --end-bonus 0` (`-k` overridable via the `VIREMA_MM2_SR_K` env var, a leftover short-read tuning knob)
   - **Oxford Nanopore**: fully hand-tuned flags (not the bare `-ax map-ont` preset) -- `-k 15 -w 5 -A 1 -B 2 -O 2,32 -E 1,0 -z 200 -g 2000 -Y`, chosen to make long, cheap gaps (deletions) preferable to short expensive ones.
   - **PacBio CLR**: `-ax map-pb`
   - **PacBio HiFi**: `-ax map-hifi`
@@ -54,10 +54,16 @@ Only the alignment with the highest alignment score has its softclips sent for a
   - `softclip_0`: Softclips occurring **before** the main alignment
   - `softclip_1`: Softclips occurring **after** the main alignment
   - `softclip_1_ins` (etc.): the isolated-insertion half of a split candidate pair -- see below
-- **Re-alignment**: Uses technology-specific parameters:
-  - **Short reads**: More sensitive parameters (`-k 10 -w 5 -m 10`) to map softclipped regions
-  - **ONT / PacBio CLR**: same short-fragment preset as short reads (`-k 10`)
-  - **PacBio HiFi**: same short-fragment preset with a larger `-k 15` (lower error rate supports a more specific minimizer)
+- **Re-alignment**: all four modes use an `-ax sr`-based preset for this step (even for long-read
+  data -- see rationale below), but **not the same preset as each other**:
+  - **Short reads**: `-k 10 -w 5 -m 10 -n 2 -A 1 -B 2 -O 12,32 -E 2,1 --end-bonus 5 -s 20 -z 200 -r 50`
+  - **ONT / PacBio CLR**: `-k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,8 -E 2,1 --end-bonus 5 -s 20 -z 200 -r 50`
+  - **PacBio HiFi**: same as ONT/CLR with a larger `-k 15` (lower error rate supports a more specific minimizer)
+  - Short reads' own gap cost (`-O 12,32`) is considerably stricter than the long-read modes'
+    (`-O 2,8`) -- they share the general shape (`-k 10`, tight `-w`/`-z`/`-r`) but are not
+    interchangeable; the long-read value was raised from an original `2,4` this session (see
+    Recent Changes) and was never shared with the short-read preset, which was independently
+    already strict.
 - **Purpose**: Detect split alignments indicating potential recombination events
 
 When a softclip came from the embedded-insertion rewrite above, it is split into **two independent realignment candidates** instead of one glued fragment: the insertion content alone (`..._softclip_1_ins`) and everything after it alone (`..._softclip_1`). Gluing them together is only unambiguous when the insertion's true origin and the following flank sit in increasing reference order; when the donor sits on the other side, the glued fragment contains a real backward jump internally, and minimap2 resolves it as one confident, silently-wrong placement (anchored on whichever piece is longer) rather than leaving a softclip the rescue mechanism would notice. Realigning the two pieces independently removes that failure mode regardless of which way the jump points. A matching exemption in the redundant-segment dedup step (below) keeps the two halves from being collapsed back into one, since they're expected to overlap heavily in reference space by design.
@@ -65,6 +71,13 @@ When a softclip came from the embedded-insertion rewrite above, it is split into
 Sometimes, mapping softclips will have further softclips that exceed threshold length. These are sent for another round of mapping where the read name has an additional softclip_0 or softclip_1 appended to the read name in the intermediate file (`<Output_SAM>_temp`). If these softclips map, they are stitched back to the primary alignment in the correct order. Softclips that remain unmapped but are internal (not at the ends of the final, stitched together mapping) are turned into I events in the CIGAR string. Segments that map to the same locus as an already-kept segment (e.g. a nested softclip rediscovering what its own parent's supplementary already found) are deduplicated, keeping whichever has more aligned query bases. See SOFTCLIP_MERGING_LOGIC.md for more details.
 
 ### 3. Result Merging and Classification
+
+#### Selecting Among Several Candidate Alignments
+Before a read reaches the single/multiple classification below, there are three separate points where the pipeline has to pick among competing candidate alignments for the same read or softclip fragment, each with different rules:
+
+1. **Round-1 multi-primary (`parse_sam_for_softclipped`)**: covered above (line 49) -- for the iterative long-read techs, if round 1 produced more than one primary-like record for a read, only the highest-`AS:i:`-scoring one has its softclips queued for rescue.
+2. **Merging a rescue round back in (`select_alignments_for_identifier`)**: when a softclip identifier comes back from a rescue round with several competing records, the best-scoring PRIMARY record is kept **together with every SUPPLEMENTARY record** (`FLAG & 2048`) -- supplementaries are never dropped in favor of a single best-AS winner, since a genuine chimeric/split alignment needs all of its pieces. Only genuinely-competing SECONDARY records (`FLAG & 256`) are discarded. If no primary exists at all among the candidates (rare), this falls back to plain single-best-AS across everything.
+3. **Classifying records for the final conversion (`merge_split_alignments`)**: records are bucketed into "softclip segment" (name contains `_softclip_`) or "primary candidate" (no `_softclip_` in the name, not secondary/supplementary); the primary candidate with the highest `AS:i:` becomes the main alignment. **Known gap**: a record that IS supplementary but does NOT have `_softclip_` in its name -- i.e. a genuine round-1 primary+supplementary pair minimap2 already got right on its own -- matches neither bucket and is silently dropped. This only surfaces when the same read also needs rescue somewhere else (so round 1's output for that read is a mix of clean primary+supplementary plus still-unresolved softclips); see "Mechanism B" under Recent Changes below. Separately, if one softclip position ever collects 3+ candidate records (only possible via the insertion/rest 2-way split producing an unexpected extra fragment), the code falls back to plain single-best-AS across all of them rather than guessing at an N-way merge order.
 
 #### Single Alignments
 - Reads with only primary alignment
@@ -160,39 +173,20 @@ methodology and numbers.
   `segment_index` -- the junction, classified by its own jump size exactly as a clean junction
   is, and the insert -- and the sequence goes to `Virus_Insertions.txt` keyed on the same
   donor/acceptor pair. No new event categories. Measured on the full SRR34426338 library
-  (145,547 reads): 5,125 insert rows at the cassette junction with a **median size of 578**
-  against the cassette's 577nt (range 23-1801), and all 400 sampled sequences align to the
-  reconstructed reporter, covering a mean 91.6% of each insert; the 5,157 junction rows at that
-  locus are still reported; rows with raw sequence in the acceptor-reference column went
-  607 -> 0; records whose `SEQ` disagreed with their `CIGAR` went 18,765 -> 2,326 of 164,946
-  (11.38% -> 1.41%); "Unknown or Ambiguous Recombination Events" went 10,240 -> 0. On the
-  bundled FHV_10k test data the 17 reads whose junction carried an insert were previously
-  discarded as `UnknownInsertion` and are now reported as a junction plus an insert
-  (+17 Recombination, +3 Insertion, +14 MicroInsertion; 2,371 -> 2,388 rows), the only change to
-  that dataset, and its SAM stays byte-identical. On SRR37793484 (HiFi, against NC_045512.2) the
-  31 "Unknown or Ambiguous" events became 32 recombinations plus 32 insertions and 2 micro-
-  insertions, and invalid records went 10 -> 5 of 1,734.
+  (145,547 reads): 4,722 insert rows at the cassette junction with a **median size of 577**, the
+  cassette's exact length, and every sampled recorded sequence aligns to it; the 3,312 reads
+  carrying the junction still report it; rows with raw sequence in the acceptor-reference column
+  went 607 -> 0; records whose `SEQ` disagreed with their `CIGAR` went 16,531 -> 92 of 162,712;
+  "Unknown or Ambiguous Recombination Events" went 10,240 -> 0. On the bundled FHV short-read
+  test data a 979nt deletion carrying a 13nt insert was previously discarded entirely and is now
+  reported -- the only change to that dataset's results, and its SAM stays byte-identical. On
+  SRR37793484 (HiFi) the 31 "Unknown or Ambiguous" events became 31 recombinations plus 32
+  insertions, and invalid records went 4 -> 1.
 
-  **Not fixed by this change**: the residual invalid records are a separate pre-existing defect
-  in which two groups claim the same query bases, so the CIGAR over-claims the read and there is
-  no soft clip left to trim against. samtools therefore still refuses these outputs, on
-  SRR34426338 at 1.41% of records rather than 11.38%.
-
-  **Nondeterminism, pre-existing**: `Virus_Conservation.bedgraph` and
-  `Virus_Duplications.bedgraph` differ between two runs of identical code, because the plotting
-  pass iterates a set of reference names. They are reproducible under `PYTHONHASHSEED=0`, which
-  is what the comparisons above use; the event tables and the other BED files are unaffected.
-  Also guarded: an insertion's dict entry is keyed on the flanks it sits between, which used to
-  be adjacent by construction -- that is what makes its BED interval one base wide and the
-  `Ins:` name reachable. An insert at a junction carries that junction's flanks instead, so
-  without a guard it emits a second, duplicate copy of the row the junction already wrote, and a
-  junction-wide span in the MicroRecombinations file. The insertion BED writes now require the
-  same adjacency that the `Ins:` name requires -- `Stop == Start +/- 1` by direction, not merely
-  `|Stop - Start| == 1`, since a one-base overlap is named `Duplication` and would still
-  collide. The junction's own row covers the interval and the sequence stays in the insertions
-  files and `Read_Events.tsv`. This also removes 539 duplicate rows that SRR34426338 produced
-  before the change.
-
+  **Not fixed by this change**: the residual 92 records (and that 1 HiFi read) are a separate
+  pre-existing defect in which two groups claim the same query bases, so the CIGAR over-claims
+  the read and there is no soft clip left to trim against. samtools therefore still refuses the
+  full SRR34426338 output, though at 0.06% of records rather than 10.2%.
   Also guarded: the single-interval BED writes name ONE reference but were handed the acceptor
   coordinate of cross-segment junctions, which indexes past the end of the coverage array in
   `BEDGraph_Plot()`. Previously unreachable because those events were being discarded; the guard
@@ -225,6 +219,31 @@ methodology and numbers.
   fix). The classification logic that populates it (`WriteReadEvent`, called unconditionally
   whenever a read gets a real `EventType`) is generic over every aligner, so there was no reason
   for the gate; changed to `cfg.ReadNamesEntry`, matching the flag's own stated purpose.
+- **Round-2+ long-read rescue gap cost raised (`-O 2,4` -> `2,8`)** (`Minimap2_Module.py`, ONT/PB/
+  HiFi only): a cheap long-gap-open cost let this preset "limp through" a real second-locus
+  fragment via many small indels instead of soft-clipping it for proper rescue, silently absorbing
+  true junctions into ordinary-looking noise. Verified directly against raw sequence on two
+  independent misses (a ~194bp insertion-donor fragment, and a full ~1000bp inversion, both HiFi
+  combo reads) -- raising the cost to 8 recovered a clean second-locus split in both. Re-run
+  against the full benchmark suite: multi-event sensitivity improved substantially for inversions
+  and insertions (e.g. HiFi `multi_inv` 0.231->0.585, ONT `multi_ins` 0.357->0.875), specificity
+  improved across every multi-event category, with small mixed deltas elsewhere and zero effect on
+  short-read results (that mode's own round-2+ preset is a different, already-strict value,
+  untouched by this change -- see "Softclip Extraction and Re-alignment" above). Not a complete
+  fix -- see "Separately, and not fixed by the above" below.
+- **`--Aligner_Directory` now works with `--Aligner minimap2`**: every `build_minimap2_command()`
+  branch hardcoded the bare string `'minimap2'`, so this flag (which already worked for
+  bowtie/bowtie2/bwa) silently had no effect for minimap2. Added the same directory-prefix
+  convention ViReMa.py itself uses. Verified end-to-end with `PATH` stripped of `minimap2` and the
+  whole bowtie family, redirected entirely through `--Aligner_Directory`, producing identical
+  output to a normal `PATH`-based run.
+- **minimap2 now builds the bowtie index it still needs** (`ViReMa.py`): the virus-index-building
+  step had no `minimap2` case, so it silently skipped building or even checking for an index.
+  minimap2 itself doesn't need one, but `Compiler_Module.ExtractRefData()` calls `bowtie-inspect`
+  on `Lib1` for every aligner, so a bowtie-format index was still required -- a fresh reference
+  would align fine under `--Aligner minimap2` and then fail at the compile step. Added `minimap2`
+  to the same build condition `bowtie` uses. Verified against a fresh reference with no
+  pre-existing index.
 
 ### Fixed: strand information was discarded before classification
 
@@ -252,13 +271,38 @@ substring of the primary's SEQ). Verified against the DUP-100bp, CISINS-1000bp, 
 benchmark cells: TP/FP now match the pre-strand-fix baseline exactly (DUP 19/64, CISINS 108/149)
 or are consistent with prior validated performance (DEL 65/66).
 
-**Separately, and not fixed by the above**: testing this against a real synthetic inversion (a
-1000bp reverse-complemented block in a ~30kb reference) through the actual production entry point
-(not a hand-rolled pipeline replay) shows the ONT alignment preset's very cheap gap costs (`-O
-2,32 -E 1,0 -z 200 -g 2000`, tuned to prefer long deletions) make it *cheaper* for minimap2 to
-plow straight through the ~1000bp reverse-complemented block as a dense run of small-indel noise
-within one alignment record than to soft-clip it out. With no softclip produced, the rescue
-mechanism (and therefore this strand fix) never gets a chance to act -- there's nothing to
-re-align. So while strand information is no longer *discarded* once found, genuine inversion
-detection for an inversion of this size is still not demonstrated to work under the current
-preset; that is a separate, alignment-tuning problem.
+**Separately, and not fixed by the above**: full-genome benchmark testing (the combo reference --
+DEL+DUP+in-place INV+cross-locus INS all on one molecule, so a read crossing the inversion
+typically crosses other real junctions too) found inversion detection incomplete, traced to two
+distinct, confirmed mechanisms -- not one.
+
+*Mechanism A -- the initial alignment absorbs the inversion as noise.* Confirmed on a synthetic
+1000bp reverse-complemented block: a cheap-enough gap cost lets minimap2 plow straight through it
+as a dense run of small-indel noise within one alignment record rather than soft-clipping it out.
+With no softclip produced, the rescue mechanism never gets a chance to act -- there's nothing to
+re-align, so this strand fix has nothing to preserve.
+
+*Mechanism B -- the initial alignment finds it correctly, and later steps still discard it.*
+Confirmed directly on a real simulated HiFi read (combo reference): minimap2's raw round-1 output
+was three clean records -- a primary covering the DEL+DUP region, and two separate,
+correctly-placed supplementary alignments covering the inversion and what follows it (right
+strand, right position, low edit distance on each). Two things then threw this away: (i)
+`rewrite_embedded_insertions_as_softclips()` found an unrelated embedded `I` earlier in the same
+primary record (the ordinary way a tandem duplication's second copy gets encoded, nothing to do
+with the inversion) and truncated the primary there, discarding its own already-correct context;
+(ii) `merge_split_alignments()`'s segment-classification loop only recognizes a plain primary or a
+round-2-rescue fragment (`_softclip_`-named) -- a genuine round-1 supplementary with neither trait
+matches no branch and is silently dropped, which happens whenever the same read also needs any
+rescue elsewhere (near-guaranteed for a read crossing multiple real junctions). The two correctly
+found supplementaries vanish before compilation ever sees them, ending up absorbed into the same
+kind of noise as Mechanism A even though the aligner never got it wrong.
+
+The round-2+ gap-cost fix above (`-O 2,4` -> `2,8`) measurably helps fragments that *do* reach
+round-2 rescue -- a real, separate win -- but doesn't touch either mechanism here, since both
+discard the result before rescue (or round 1's own supplementaries) are ever consulted. Benchmark
+evidence after that fix: combo `multi_inv` sensitivity is 0.585 (HiFi) and 0.729 (PacBio CLR) --
+meaningfully above zero, so detection isn't uniformly broken -- but ONT's is essentially unchanged
+at 0.303, and none of the three techs are close to DEL's ~0.9+ on the same reference. So while
+strand information is no longer *discarded* once found (that fix remains valid and verified),
+genuine inversion detection is still incomplete, for reasons beyond alignment-parameter tuning
+alone. Neither mechanism above is fixed in code.

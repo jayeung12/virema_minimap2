@@ -27,14 +27,25 @@ minimap2 backend achieves this by a two-stage strategy:
   single large embedded 'I' CIGAR operation, rather than splitting into
   primary+supplementary records -- there is then no softclip for the
   extraction step below to ever notice.
-  rewrite_embedded_insertions_as_softclips() finds one qualifying
+  rewrite_embedded_insertions_as_softclips() finds the FIRST qualifying
   embedded 'I' per record (longer than MicroInDel_Length and at least
-  SEED_THRESHOLD) and rewrites it into an explicit trailing softclip,
-  run on every round's own output. When that softclip is then
+  SEED_THRESHOLD) and rewrites everything from that point onward -- the
+  insertion itself plus everything after it -- into one explicit
+  trailing softclip, run on every round's own output. Only 'I' is ever
+  touched; 'D'/'N' operations are left alone, so this cannot affect
+  deletion detection. Two guards can suppress the rewrite entirely for a
+  record: there must be real aligned content (M/=X) before the split
+  point (otherwise there's nothing left to call a meaningful primary),
+  and -- for records that already have more than one qualifying 'I' --
+  only the first is ever rewritten per pass; a second one surviving
+  inside what gets clipped off is caught in a later round when that
+  piece's own alignment is scanned again. When that softclip is then
   extracted, it is split into two independent realignment candidates --
   the insertion content alone, and everything after it alone -- rather
-  than realigned as one glued fragment; see "PHASE 2/3" notes below for
-  why.
+  than realigned as one glued fragment, UNLESS either half would fall
+  below SEED_THRESHOLD, in which case it's left as one glued candidate
+  (nothing to gain by splitting a piece too short to independently seed
+  anyway); see "PHASE 2/3" notes below for why splitting matters.
 
   Stage 2 - Compilation: Compiler_Module.py reads the ViReMa-formatted
   SAM file and tallies recombination junctions, deletions, insertions,
@@ -42,12 +53,9 @@ minimap2 backend achieves this by a two-stage strategy:
 
 The four invocation modes differ only in the minimap2 preset used
 for the initial and re-alignment steps and how softclipped reads are
-selected for re-alignment. All three long-read modes (ont/pb/hifi) now
+selected for re-alignment. All three long-read modes (ont/pb/hifi)
 share the same iterative re-alignment pipeline and the same embedded-
-insertion rewrite; PacBio CLR/HiFi previously used a single non-iterated
-round with the whole-read preset reused for softclip rescue, which was
-found to fail outright on short extracted fragments, and were unified
-with ONT's short-fragment-tuned, iterative approach.
+insertion rewrite.
 
 
 ------------------------------------------------------------------------
@@ -66,14 +74,29 @@ Relevant config variables (ConfigViReMa.py) set by MainArgs():
                       (default 25 nt); used as SEED_THRESHOLD in
                       Minimap2_Module
   cfg.Chunk         - Number of reads per processing chunk (default 1M)
+  cfg.MicroInDel_Length - Size below which an indel is ordinary noise
+                      (default 0); used as MICROINDEL_THRESHOLD in
+                      Minimap2_Module, most notably by
+                      rewrite_embedded_insertions_as_softclips()
+  cfg.Aligner_Directory - Optional path prefix for the aligner binary
+                      (--Aligner_Directory); prefixed onto 'minimap2' the
+                      same way ViReMa.py prefixes it onto 'bowtie'/'bwa'/
+                      'bowtie2' everywhere they're called
 
-Index building: for minimap2, ViReMa does not pre-build any index -- the
-reference FASTA is passed directly to minimap2 on every invocation (each
-round uses different -k/-w flags, and a prebuilt .mmi index bakes those
-parameters in at build time, silently overriding whatever the command line
-requests; an earlier version of this pipeline built and reused a .mmi index,
-which was found to cause exactly this problem, and the index-build step was
-removed).
+Index building (ViReMa.py, around the `if not exists(cfg.Lib1 + '.1.ebwt')`
+check just before the main script body runs): minimap2 itself is never
+given a prebuilt index -- the reference FASTA is passed directly to it on
+every invocation (each round uses different -k/-w flags, and a prebuilt
+.mmi index bakes those parameters in at build time, silently overriding
+whatever the command line requests; an earlier version of this pipeline
+built and reused a .mmi index, which was found to cause exactly this
+problem, and the index-build step was removed). However, a bowtie-FORMAT
+index is still built for minimap2 runs (`bowtie-build cfg.Lib1 cfg.Lib1`,
+gated on `cfg.Aligner in ('bowtie', 'minimap2')`) -- not for alignment, but
+because Compiler_Module.ExtractRefData() unconditionally shells out to
+`bowtie-inspect` on cfg.Lib1 during the compilation phase (to recover
+reference names/sequences), regardless of which aligner actually mapped the
+reads.
 
 
 ------------------------------------------------------------------------
@@ -84,26 +107,34 @@ SITUATION 1: python ViReMa.py --Aligner minimap2
 Step 1 - Initial alignment (Minimap2_Module.py: build_minimap2_command,
                              long_read_tech=None, is_initial=True)
 
-  Command:
-    minimap2 -ax sr -k 20 -A 1 -B 2 -O 1,1 -E 1,1 -r 100 -g 2000
-             -z 2000,1000 -f 0.0001 -n 1 -p 0.05 -N 5 -s 5 -t 8
-             --end-bonus 0 <Lib1> <File1>
+  Command (build_minimap2_command, long_read_tech=None, is_initial=True):
+    minimap2 -ax sr -k <20, or $VIREMA_MM2_SR_K if set> -A 1 -B 2
+             -O 2,8 -g 2000 -z 800,400 -n 1 -p 0.3 -N 3 -s 20
+             -t <Threads> --end-bonus 0 <Lib1> <File1>
     Output written to: output.sam
 
   Parameter rationale:
     -ax sr         - short-read preset (splice-unaware, high sensitivity)
-    -k 20          - k-mer size suitable for accurate short reads
+    -k              - k-mer size; 20 by default, overridable via the
+                      VIREMA_MM2_SR_K environment variable (a leftover
+                      tuning knob from short-read development; no other
+                      part of the pipeline reads this env var)
     -A/-B 1/2      - low mismatch penalty encourages longer alignments
-    -O 1,1 -E 1,1  - very low gap penalties (viral genomes may have
-                     small indels that should not break the alignment)
-    -r 100         - bandwidth for chaining
+    -O 2,8         - dual gap-open cost (short-gap/long-gap); not as
+                     permissive as a flat low cost on both would be --
+                     see the Round-2+ gap-cost note below for why a cheap
+                     long-gap cost is a real liability, not just a tuning
+                     nicety, once a fragment can itself contain a second
+                     true locus (the rationale there applies to this round
+                     too, though it was the round-2+ presets where the
+                     effect was actually measured and fixed)
     -g 2000        - max intron/gap size during chaining
-    -z 2000,1000   - Z-drop for extension
-    -f 0.0001      - minimizer frequency threshold (reduces repetitive hits)
-    -n 1 -p 0.05   - minimum chaining seeds and secondary alignment ratio
-    -N 5           - up to 5 secondary alignments retained
-    -s 5           - minimum DP score
+    -z 800,400     - Z-drop (extension) and inversion Z-drop
+    -n 1 -p 0.3    - minimum chaining seeds and secondary alignment ratio
+    -N 3           - up to 3 secondary alignments retained
+    -s 20          - minimum DP score
     --end-bonus 0  - no bonus for aligning to read ends
+    (no explicit -w/-E here -- minimap2's own -ax sr defaults apply)
 
 Step 2 - Identify soft-clipped primary alignments
   (Minimap2_Module.py: parse_sam_for_softclipped, long_read_tech=None)
@@ -133,27 +164,47 @@ Step 4 - Second-round alignment
    is_initial=False)
 
   Command:
-    minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,4 -E 2,1
+    minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 1 -B 2 -O 12,32 -E 2,1
              --end-bonus 5 -s 20 -z 200 -r 50
              <Lib1> ./Test_Data/TEMP_READS.txt
     Output written to: TEMP_SAM
 
   Compared with Round 1, this uses a smaller k-mer (-k 10) and a
   tighter search window (-w 5, -z 200 -r 50) appropriate for the
-  shorter, already-trimmed soft-clip sequences.
+  shorter, already-trimmed soft-clip sequences. Note the gap-open cost
+  (-O 12,32) is considerably stricter than Round 1's (-O 2,8) and than
+  the long-read modes' own round-2+ preset (-O 2,8, see Situation 2 Step
+  4) -- this short-read rescue preset was never touched by the gap-cost
+  investigation described there, so it's independently already strict
+  rather than sharing that fix.
 
 Step 5 - Merge TEMP_SAM into output.sam
   (Minimap2_Module.py: merge_temp_sam_to_output)
 
   For each base read name that has softclip sub-reads in TEMP_SAM:
     - All alignments for each softclip identifier are collected.
-    - The alignment with the highest AS (alignment score) tag is
-      selected.
+    - select_alignments_for_identifier() keeps the best-scoring PRIMARY
+      record (FLAG & (256|2048) == 0) for that identifier BY AS score,
+      PLUS every SUPPLEMENTARY record (FLAG & 2048) for the same
+      identifier -- supplementaries are complementary parts of the same
+      chimeric alignment (e.g. this identifier's own realignment split
+      into a genuine primary+supplementary pair), not competing
+      alternatives, so collapsing them down to a single "best" record
+      would silently discard a real segment. Only genuinely competing
+      SECONDARY records (FLAG & 256) are dropped. This is NOT a plain
+      single-best-AS selection -- an earlier version of this function
+      was, and lost real segments as a result.
+      Edge case: if no primary exists among the candidates for an
+      identifier at all (shouldn't normally happen), this falls back to
+      plain single-best-AS selection across all of them rather than
+      guessing. (A separate 3+-candidates fallback exists later, in
+      merge_split_alignments -- see Step 6 below.)
     - The selected softclip alignments are appended immediately after
       the original primary alignment line for that base read.
 
   output.sam now contains, for each split read, the primary alignment
-  followed by the softclip sub-alignment(s).
+  followed by the softclip sub-alignment(s) -- which may include more
+  than one record per identifier when a supplementary was kept.
 
 Step 6 - Convert to ViReMa format
   (Minimap2_Module.py: convert_to_virema_format)
@@ -166,7 +217,18 @@ Step 6 - Convert to ViReMa format
       - If the read has multiple records (the main alignment plus one or
         more softclip alignments), merge_split_alignments() is called:
 
-          a. Classify records:
+          0. If EVERY record for this base read name is unmapped (FLAG &
+             4), the first one is returned as-is (renamed to the base
+             read name) and nothing further below runs. This is a
+             defensive fallback, not something expected to trigger in
+             practice -- the base read's own primary record is only ever
+             reachable here because Step 2 required it to have 'S' in
+             its CIGAR, which implies it was mapped.
+
+          a. Classify records (mapped ones only -- FLAG & 4 == 0 is
+             required for BOTH branches below; an unmapped round-2+
+             rescue attempt that failed to realign is simply ignored,
+             not merged in as noise):
                - Records without _softclip_ in name and not
                  supplemental (FLAG & 2048 == 0) are primary candidates.
                - Records with _softclip_ in name are softclip segments;
@@ -174,7 +236,31 @@ Step 6 - Convert to ViReMa format
                  (0.4 = before main, 0.6 = after main, with recursive
                  sub-intervals for nested clips).
              The primary candidate with the highest AS score is chosen
-             as the main alignment.
+             as the main alignment. If there are NO primary candidates
+             at all (shouldn't normally happen, for the same reason as
+             0. above), the whole read is silently dropped from the
+             final output -- convert_to_virema_format() treats a None
+             result from merge_split_alignments() as "nothing to write"
+             for that base read name.
+             GAP (not yet fixed -- see the FIXED/STILL-OPEN note at the
+             end of this document, Mechanism B): a record that is
+             supplementary (FLAG & 2048) but does NOT have _softclip_ in
+             its name -- a genuine round-1 primary+supplementary pair
+             that minimap2 already got right, never touched by the
+             rescue pipeline -- matches NEITHER branch above and is
+             silently dropped from `segments` entirely. This fires
+             whenever the same base read also needs ANY rescue
+             elsewhere (near-guaranteed for a read crossing multiple
+             real junctions, since round 1 then produces a mix of
+             primary + supplementary + still-unresolved-softclip output
+             for that one read).
+             At one softclip position (seq_pos), usually exactly one
+             candidate exists; if a position ever has 3+ candidates (can
+             only arise from _softclip_candidates_for_record's 2-way
+             insertion/rest split producing more than the expected
+             pair), this falls back to plain single-best-AS selection
+             across all of them rather than guessing at an N-way
+             ordering that hasn't been observed or verified.
 
           b. Sort segments by their sequence-space position (seq_pos).
 
@@ -220,14 +306,26 @@ Step 1 - Initial alignment (build_minimap2_command, long_read_tech='ont',
                              is_initial=True)
 
   Command:
-    minimap2 -ax map-ont -Y <Lib1> <File1>
+    minimap2 -a -k 15 -w 5 -A 1 -B 2 -O 2,32 -E 1,0 -z 200 -g 2000 -Y
+             <Lib1> <File1>
     Output written to: output.sam
 
+  NOT the bare -ax map-ont preset -- fully hand-tuned flags instead (-a
+  alone, not -ax map-ont). This was changed from the stock preset
+  deliberately: the dual gap-open cost (-O 2,32) and flat extend cost
+  (-E 1,0) make a long deletion-like gap cheap relative to a run of
+  short indels, which -ax map-ont's own defaults don't prioritize in the
+  same way.
+
   Parameter rationale:
-    -ax map-ont  - ONT preset: long reads with ~10-15% error rate;
-                   uses homopolymer-aware k-mers and gap penalties
-                   tuned for nanopore-characteristic indel noise.
-    -Y           - Use soft clipping (rather than hard clipping) for
+    -k 15 -w 5     - minimizer k-mer/window size
+    -A 1 -B 2      - match/mismatch score
+    -O 2,32 -E 1,0 - dual gap-open/extend cost, tuned to make long,
+                     cheap gaps (deletions) preferable to short,
+                     expensive ones
+    -z 200         - Z-drop / inversion Z-drop
+    -g 2000        - max intron/gap size during chaining
+    -Y             - Use soft clipping (rather than hard clipping) for
                    supplementary alignments, so that the full read
                    sequence is preserved in every SAM record; this is
                    critical for the downstream softclip extraction step.
@@ -260,13 +358,40 @@ Step 4 - Iterative alignment  (run_iterative_ont_alignment(long_read_tech))
 
   Round 2+ alignment command (is_initial=False):
     ONT / PacBio CLR:
-      minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,4 -E 2,1
+      minimap2 -ax sr -k 10 -w 5 -m 10 -n 2 -A 2 -B 2 -O 2,8 -E 2,1
                --end-bonus 5 -s 20 -z 200 -r 50
                <Lib1> ./Test_Data/TEMP_READS.txt
     PacBio HiFi: same preset with -k 15 (lower error rate supports a
       larger, more specific minimizer; k=10 is tuned for the ~85%-
       accuracy ONT/CLR regime).
     Output written to: TEMP_SAM
+
+  Gap-cost note (-O 2,8, raised from an original 2,4): the long-gap-open
+  cost was cheap enough that this preset could "limp through" a real
+  second-locus fragment via many small indels rather than soft-clipping
+  it for proper rescue -- silently absorbing a true junction into what
+  looks like ordinary noise, with no trace in the output at all (not
+  even an UnknownRecombination entry). Verified directly against raw
+  sequence on two independent misses, both HiFi combo reads: one where a
+  ~194bp insertion-donor fragment riding at the end of a ~5.3kb rescue
+  fragment was absorbed this way, and one where an entire ~1000bp
+  inversion got the same treatment. Raising the long-gap-open cost from
+  4 to 8 (holding everything else fixed) recovered a clean second-locus
+  split in both cases, confirmed down to near-zero edit distance on the
+  recovered segment. Re-run against the full long+short-read benchmark
+  suite: multi-event sensitivity improved substantially for inversions
+  and insertions in particular (e.g. HiFi multi_inv 0.231->0.585, PacBio
+  CLR multi_inv 0.492->0.729, ONT multi_ins 0.357->0.875), specificity
+  improved across every multi-event category and tech, with small mixed
+  deltas (both directions) on ordinary single-junction events and zero
+  effect on short-read results (short-read mode's own round-2+ preset,
+  see Situation 1 Step 4, uses a different, already-strict gap cost and
+  was untouched by this change). Not a complete fix: ONT's own
+  multi-inversion sensitivity barely moved (0.318->0.303), and even a
+  fixed fragment that does split correctly may still need further
+  rescue rounds to fully resolve every junction it contains -- see the
+  FIXED/STILL-OPEN note at the end of this document for the fuller
+  picture on inversion detection specifically.
 
   Note: although the data originated from a long-read technology, the
   re-alignment of soft-clip fragments uses a short-read-style preset
@@ -529,7 +654,12 @@ Re-alignment preset      -ax sr(relaxed) -k 10 (relaxed) -k 10 (relaxed) -k 15 (
 Iterative re-alignment   No (1 round)    Yes (up to 6x)  Yes (up to 6x)  Yes (up to 6x)
 Nested clip naming       _softclip_0/1   _softclip_0/1   _softclip_0/1   _softclip_0/1
                                          (+ recursive, + _ins variants for all three)
-Compilation              Identical       Identical       Identical       Identical
+Compilation              See note(*)     Identical       Identical       Identical
+
+(*) Compilation is NOT fully identical for short-read mode: the small-
+    residual Donor/Acceptor salvage logic (see COMPILATION PHASE section
+    above, "Long-read mode only") is gated on cfg.LongReadTech being
+    truthy, so it applies to ont/pb/hifi but not to plain short-read mode.
 
 All four modes write a ViReMa-compatible SAM in which each split read is
 represented either as a single record with N gaps in the CIGAR (for
@@ -587,18 +717,60 @@ match the pre-fix baseline exactly (DUP 19/64, CISINS 108/149) or are
 consistent with prior validated performance (DEL 65/66) -- i.e. the
 regression is fully resolved, not merely reduced.
 
-SEPARATE, STILL-OPEN ISSUE: testing this fix against a real synthetic
-inversion (a 1000bp reverse-complemented block in a ~30kb reference)
-through the actual production entry point (ViReMa.py directly, not a
-hand-rolled pipeline replay used during initial debugging) shows the
-ONT preset's very cheap gap costs (-O 2,32 -E 1,0 -z 200 -g 2000, tuned
-to prefer long deletions) make it *cheaper* for minimap2 to plow
-straight through the reverse-complemented block as a dense run of
-small-indel noise within one alignment record than to soft-clip it out.
-With no softclip produced, the rescue mechanism never gets a chance to
-act on that region at all -- there is nothing to re-align, so this
-strand fix has nothing to preserve. So while strand information is no
-longer discarded once found, genuine inversion detection for an
-inversion of this size is not demonstrated to work under the current
-ONT preset. This looks like a separate, alignment-parameter-tuning
-problem, not a classification/strand-propagation problem.
+SEPARATE, STILL-OPEN ISSUE: full-genome benchmark testing (the combo
+reference: DEL+DUP+in-place INV+cross-locus INS all on one molecule, so
+a read crossing the inversion typically also crosses other real
+junctions first) found inversion detection to be incomplete, and traced
+it to (at least) two distinct, confirmed mechanisms -- not one. Both
+are documented findings from real-data investigation; neither is fixed
+in code.
+
+Mechanism A -- the initial alignment itself absorbs the inverted block
+as noise instead of soft-clipping it. Confirmed on a synthetic 1000bp
+reverse-complemented block: a cheap-enough gap cost lets minimap2 plow
+straight through it as a dense run of small-indel noise within one
+alignment record rather than soft-clipping it out. With no softclip
+produced, the rescue mechanism never gets a chance to act on that
+region at all -- there is nothing to re-align, so the strand fix above
+has nothing to preserve.
+
+Mechanism B -- the initial alignment finds the inversion CORRECTLY, and
+later pipeline steps still discard it. Confirmed directly on a real
+simulated HiFi read (combo reference): minimap2's raw round-1 output
+was three clean records -- a primary covering the DEL+DUP region, and
+TWO separate, correctly-placed supplementary alignments covering the
+inversion and the region past it (strand flags and positions both
+right, low edit distance on each). Two things then threw this away
+before compilation ever saw it:
+  (i)  rewrite_embedded_insertions_as_softclips() found an UNRELATED
+       embedded 'I' earlier in the same primary record -- the ordinary
+       way a tandem duplication's second copy gets encoded, nothing to
+       do with the inversion -- and truncated the primary there,
+       discarding its own already-correct alignment context.
+  (ii) merge_split_alignments()'s segment-classification loop only
+       recognizes two kinds of record for a base read: a plain primary,
+       or a round-2-rescue fragment carrying "_softclip_" in its name.
+       A genuine round-1 supplementary with neither trait matches
+       NEITHER branch and is silently dropped -- which happens whenever
+       the same read also needs ANY rescue elsewhere (near-guaranteed
+       for a read crossing multiple real junctions, since that's
+       exactly when round-1 produces mixed primary+supplementary+
+       still-unresolved-softclip output for one read).
+  The net result: two correctly-found supplementary alignments vanish
+  between round 1 and compilation, and the inversion ends up absorbed
+  into the SAME kind of same-strand small-indel noise as Mechanism A,
+  even though the aligner never actually got it wrong.
+
+The round-2+ gap-cost fix documented above (-O 2,4 -> 2,8) measurably
+improves detection in aggregate -- it specifically helps fragments that
+DO reach round-2 rescue, which is a real and separate win -- but it
+does not touch either mechanism above, since both discard the result
+before rescue (or before round 1's own supplementaries) are ever
+consulted. Benchmark evidence after that fix: combo multi_inv
+sensitivity is 0.585 (HiFi) and 0.729 (PacBio CLR) -- meaningfully
+above zero, so inversion detection is not uniformly broken -- but ONT's
+is essentially unchanged at 0.303, and none of the three techs are
+close to DEL's ~0.9+ sensitivity on the same reference. So while strand
+information is no longer discarded once found (the fix above remains
+valid and verified), genuine inversion detection is still incomplete,
+for reasons that go beyond alignment-parameter tuning alone.
