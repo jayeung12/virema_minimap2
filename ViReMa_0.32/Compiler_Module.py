@@ -1358,7 +1358,7 @@ def ResultsSort(File1):
                                         if Acceptor == Donor and "_RevStrand" in Donor and int(DonorSite) == (int(AcceptorSite) + 1):
                                             Insertion = Rev_Comp(Insertion)
                                             #Simple Insertion Event in negative strand
-                                            if len(Insertion) >= cfg.MicroInDel_Length:
+                                            if len(Insertion) > cfg.MicroInDel_Length:
                                                 InsCount += 1
                                                 HasRealEvent = True
                                                 EventType, EventSize = "Insertion", len(Insertion)
@@ -1370,7 +1370,7 @@ def ResultsSort(File1):
                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, uInsDicts, ReadName)
                                         elif Acceptor == Donor and "_RevStrand" not in Donor and int(AcceptorSite) == (int(DonorSite) + 1):
                                             #Simple Insertion Event
-                                            if len(Insertion) >= cfg.MicroInDel_Length:
+                                            if len(Insertion) > cfg.MicroInDel_Length:
                                                 InsCount += 1
                                                 HasRealEvent = True
                                                 EventType, EventSize = "Insertion", len(Insertion)
@@ -1508,7 +1508,16 @@ def ResultsSort(File1):
                                                                         ViraltoHostRecombinationCount += 1
                                                         #Record the insert itself, whatever the junction turned out to be, so it is
                                                         #visible both in Virus_Insertions.txt and as its own ordered row.
-                                                        if len(Insertion) >= cfg.MicroInDel_Length:
+                                                        #
+                                                        #The micro boundary is inclusive: every gap test in this file asks
+                                                        #"<= MicroInDel_Length", and the summary line printed at the end says
+                                                        #MicroIndels are those "less than or equal to" the threshold. The two
+                                                        #insertion branches above asked ">=" instead, so with --MicroInDel_Length 20
+                                                        #a 20nt DELETION was a MicroDeletion while a 20nt INSERTION was a full
+                                                        #Insertion -- the same size on opposite sides of the same threshold. Use
+                                                        #">" here and in those branches so both event families agree. With the
+                                                        #default threshold of 0 nothing changes: an insert is never 0nt long.
+                                                        if len(Insertion) > cfg.MicroInDel_Length:
                                                                 InsCount += 1
                                                                 HasRealEvent = True
                                                                 AddInsToDict(Donor, DonorSite, AcceptorSite, Insertion, InsDicts, ReadName)
