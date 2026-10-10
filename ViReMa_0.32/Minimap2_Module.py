@@ -1792,10 +1792,15 @@ def _rev_comp(sequence):
     return sequence.translate(_COMPLEMENT)[::-1]
 
 
-def _query_interval_in_read(read_fields, read_sequence):
-    """Where this record's ALIGNED block sits in the base read's own coordinates.
+def _locate_record(read_fields, read_sequence):
+    """Where this record's ALIGNED block sits in the base read's own coordinates, plus the frame
+    details needed to walk its CIGAR there.
 
-    Returns (start, end) as offsets into `read_sequence`, or None when it cannot be placed.
+    Returns (start, end, flipped, lead), or None when the record cannot be placed: `start`/`end`
+    are offsets into `read_sequence`, `flipped` says whether this record's SEQ is
+    reverse-complemented relative to that frame, and `lead` is the offset WITHIN SEQ at which the
+    aligned block begins (SEQ is in the record's own frame, so this is its own leading clip
+    either way).
 
     Nothing in the SAM states this directly: each record's CIGAR and SEQ are expressed in its
     own frame (a softclip fragment's frame, possibly reverse-complemented, possibly with the
@@ -1852,8 +1857,131 @@ def _query_interval_in_read(read_fields, read_sequence):
         if read_sequence.count(oriented) != 1:
             continue
         start = read_sequence.find(oriented) + (trail if flipped else lead)
-        return start, start + _aligned_query_len(read_fields[5])
+        return start, start + _aligned_query_len(read_fields[5]), flipped, lead
     return None
+
+
+def _query_interval_in_read(read_fields, read_sequence):
+    """Just the (start, end) query interval from _locate_record, for callers that need no more."""
+    located = _locate_record(read_fields, read_sequence)
+    return None if located is None else (located[0], located[1])
+
+
+_REFERENCE_CACHE = None
+
+
+def _reference_sequences():
+    """The virus reference FASTA, parsed once, as {record name: sequence}.
+
+    Needed to judge which of two query-overlapping alignments actually explains the bases they
+    both claim (see _window_mismatch_rate). Viral references are small, so holding them costs
+    little; an unreadable or unset index yields {} and disables that comparison rather than
+    failing the run.
+    """
+    global _REFERENCE_CACHE
+    if _REFERENCE_CACHE is None:
+        sequences = {}
+        try:
+            name, parts = None, []
+            with open(VIRUS_INDEX) as handle:
+                for line in handle:
+                    if line.startswith('>'):
+                        if name is not None:
+                            sequences[name] = ''.join(parts).upper()
+                        name, parts = line[1:].split()[0], []
+                    elif name is not None:
+                        parts.append(line.strip())
+            if name is not None:
+                sequences[name] = ''.join(parts).upper()
+        except (OSError, TypeError, ValueError):
+            sequences = {}
+        _REFERENCE_CACHE = sequences
+    return _REFERENCE_CACHE
+
+
+def _window_mismatch_rate(read_fields, read_sequence, window):
+    """How well this record explains the contested bases: mismatches / bases compared, or None
+    when that cannot be judged (unplaceable record, no reference, or nothing of the window is
+    aligned by this record).
+
+    This is the question a query-overlap tie-break actually needs to answer. Two alignments that
+    overlap in query space both CLAIM the contested bases, but normally only one of them MATCHES
+    there: the other has been extended past the junction into sequence belonging to the far side
+    and pays for it in mismatches. Comparing whole-alignment scores answers a different question
+    and is biased by length -- on read loc1_S1_3 of hifi/fhv_600bp_fwd a 645 nt block outscored a
+    299 nt one and so won 46 contested bases that matched the 299 nt block's reference exactly
+    (0/46) and its own with 26/46, moving the junction 46 nt off its true position.
+    """
+    located = _locate_record(read_fields, read_sequence)
+    if located is None:
+        return None
+    start, end, flipped, lead = located
+    reference = _reference_sequences().get(read_fields[2])
+    if not reference:
+        return None
+    sequence = read_fields[9]
+    window_start, window_end = window
+    ops = re.findall(r'(\d+)([MIDNSHPX=])', read_fields[5])
+    while ops and ops[0][1] in 'SH':
+        ops.pop(0)                        # `lead` already gives the leading clip's span in SEQ
+    own_query = lead                      # offset into SEQ
+    ref_pos = int(read_fields[3]) - 1     # SAM POS is 1-based
+    aligned = 0                           # query bases consumed within the aligned block
+    mismatches = compared = 0
+    for length, op in ops:
+        length = int(length)
+        if op in 'M=X':
+            # A flipped record's own frame runs opposite to the base read's, so this op's first
+            # aligned base is the base read's LAST one of the op.
+            if flipped:
+                op_lo, op_hi = end - (aligned + length), end - aligned
+            else:
+                op_lo, op_hi = start + aligned, start + aligned + length
+            if op_hi > window_start and op_lo < window_end:      # else wholly outside the window
+                for step in range(length):
+                    offset = (end - 1 - (aligned + step)) if flipped else (start + aligned + step)
+                    if not window_start <= offset < window_end:
+                        continue
+                    if own_query + step >= len(sequence) or ref_pos + step >= len(reference):
+                        continue
+                    compared += 1
+                    if sequence[own_query + step].upper() != reference[ref_pos + step]:
+                        mismatches += 1
+            own_query += length
+            ref_pos += length
+            aligned += length
+        elif op == 'I':
+            own_query += length
+            aligned += length
+        elif op in 'DN':
+            ref_pos += length
+        else:
+            break                         # a trailing clip ends the aligned block
+    if not compared:
+        return None
+    return mismatches / compared
+
+
+def _pick_overlap_loser(index_a, index_b, read_a, read_b, read_sequence, window):
+    """Which of two query-overlapping records gives up the contested bases, and from which end.
+
+    `index_a` is the earlier-starting one, so if it loses it is trimmed on its trailing side and
+    if `index_b` loses it is trimmed on its leading side.
+
+    Decided on each record's mismatch rate ACROSS THE CONTESTED WINDOW ONLY -- the worse fit
+    there is the over-extended alignment and loses. Whole-alignment score is kept only as the
+    last resort for when the window cannot be judged for both, because it is length-biased and
+    gets this wrong (see _window_mismatch_rate).
+    """
+    rate_a = _window_mismatch_rate(read_a, read_sequence, window)
+    rate_b = _window_mismatch_rate(read_b, read_sequence, window)
+    if rate_a is not None and rate_b is not None and rate_a != rate_b:
+        loser = index_a if rate_a > rate_b else index_b
+    elif get_as_score_from_read_fields(read_a) < get_as_score_from_read_fields(read_b):
+        loser = index_a
+    else:
+        loser = index_b
+    return loser, ('trailing' if loser == index_a else 'leading')
 
 
 def _trim_query_side(read_fields, bases, own_frame_side):
@@ -1930,12 +2058,12 @@ def _resolve_query_overlaps(segments, read_sequence):
     there had three blocks claiming 8,790 bases of an 8,144 nt read, over by exactly the 646 nt
     two of them shared.
 
-    Each contested base goes to the better-scoring alignment and is hard-clipped off the other,
-    so the blocks partition the read and the clips derived from them are right. Note what this
-    does NOT settle: where inside the contested stretch the junction truly lies is not
-    recoverable from the alignments -- both ends explain those bases. Picking the better-scoring
-    alignment picks one end of that window, so a junction's reported coordinates can sit up to
-    the overlap's length away from another equally-consistent placement.
+    The contested bases go to whichever alignment actually matches the reference across them
+    (_pick_overlap_loser) and are hard-clipped off the other, so the blocks partition the read and
+    the clips derived from them are right. Where both alignments fit the contested bases equally
+    well the junction's position within them genuinely is not recoverable from the alignments, and
+    the reported coordinates can sit up to the overlap's length from another equally-consistent
+    placement; ViReMa's own --Defuzz/MaxFuzz addresses that residue at the compiler level.
 
     Runs to a fixpoint rather than one pass, so that a block sitting entirely INSIDE another
     (trimming one edge cannot separate those) is resolved too -- there the contained block is
@@ -1976,11 +2104,10 @@ def _resolve_query_overlaps(segments, read_sequence):
         if right[1] <= left[1]:
             # Contained: only the inner block can give way.
             loser, true_side = j, 'leading'
-        elif (get_as_score_from_read_fields(placed[i][0]['read'])
-              < get_as_score_from_read_fields(placed[j][0]['read'])):
-            loser, true_side = i, 'trailing'
         else:
-            loser, true_side = j, 'leading'
+            loser, true_side = _pick_overlap_loser(
+                i, j, placed[i][0]['read'], placed[j][0]['read'], read_sequence,
+                (max(left[0], right[0]), min(left[1], right[1])))
 
         target = placed[loser][0]
         trimmed = _trim_query_side(
