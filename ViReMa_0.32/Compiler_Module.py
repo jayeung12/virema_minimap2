@@ -476,7 +476,12 @@ def AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, Dict, ReadName):
                                 Dict[Donor + "_to_" + Acceptor][DonorSite + "_to_" + AcceptorSite] += 1
         else:
                 pass
-        return Donor + "_to_" + Acceptor, DonorSite + "_to_" + AcceptorSite
+        #Return the sites this event was actually FILED under. With --Defuzz these are the
+        #canonical ends of the fuzzy region rather than the sites passed in, so a caller that
+        #also writes a per-read row can keep that row agreeing with the aggregate file. The
+        #previous return value was a pair of pre-joined dictionary keys, which every caller
+        #assigned and threw away.
+        return DonorSite, AcceptorSite
 
 ##      ----------------------------------------------------------------------------------------------------------------
 ##      FindFuzz() will determine the number of overlapping nucleotides in the donor region and the nucleotides
@@ -1283,6 +1288,10 @@ def ResultsSort(File1):
                                 #is written as its own row sharing the junction's segment_index,
                                 #so read order is preserved and the block count stays derivable.
                                 ExtraEvent = None
+                                #Sites to write the per-read row(s) with. They stay None unless
+                                #AddToDict hands back different ones, which only --Defuzz does.
+                                FiledDonorSite = None
+                                FiledAcceptorSite = None
                                 Donor = line[i]
                                 #Ref = Donor
                                 if "RevStrand" in line[i+1]:
@@ -1316,7 +1325,7 @@ def ResultsSort(File1):
                                                     #MicroDeletion on negative strand
                                                     uCount += 1
                                                     EventType, EventSize = "MicroDeletion", int(DonorSite) - int(AcceptorSite) - 1
-                                                    x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                    FiledDonorSite, FiledAcceptorSite = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
                                         elif Donor == Acceptor and "_RevStrand" not in Donor and fabs(int(DonorSite) - int(AcceptorSite) + 1) <= cfg.MicroInDel_Length:
                                             if int(DonorSite) - int(AcceptorSite) + 1 > 0:
                                                     #MicroInsertion
@@ -1330,7 +1339,7 @@ def ResultsSort(File1):
                                                     #MicroDeletion
                                                     uCount += 1
                                                     EventType, EventSize = "MicroDeletion", int(AcceptorSite) - int(DonorSite) - 1
-                                                    x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                    FiledDonorSite, FiledAcceptorSite = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
                                         else:
                                                 #Direct Recombination Event
                                                 RecombCount += 1
@@ -1339,7 +1348,7 @@ def ResultsSort(File1):
                                                     EventType, EventSize = "Recombination", int(DonorSite) - int(AcceptorSite) - 1
                                                 else:
                                                     EventType, EventSize = "Recombination", int(AcceptorSite) - int(DonorSite) - 1
-                                                x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
+                                                FiledDonorSite, FiledAcceptorSite = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
                                                 if Donor in cfg.RefsLib1 and Acceptor in cfg.RefsLib1:
                                                         ViralRecombinationCount +=1
                                                 elif Donor in cfg.RefsLib2 and Acceptor in cfg.RefsLib2:
@@ -1482,7 +1491,7 @@ def ResultsSort(File1):
                                                                 if JumpSize > 0:
                                                                         uCount += 1
                                                                         EventType, EventSize = "MicroDeletion", JumpSize
-                                                                        x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
+                                                                        FiledDonorSite, FiledAcceptorSite = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, uDelDicts, ReadName)
                                                                 elif JumpSize < 0:
                                                                         uCount += 1
                                                                         DonorA = Donor[:-10] if "_RevStrand" in Donor else Donor
@@ -1499,7 +1508,7 @@ def ResultsSort(File1):
                                                                 RecombCount += 1
                                                                 HasRealEvent = True
                                                                 EventType, EventSize = "Recombination", JumpSize
-                                                                x = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
+                                                                FiledDonorSite, FiledAcceptorSite = AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, RecDicts, ReadName)
                                                                 if Donor in cfg.RefsLib1 and Acceptor in cfg.RefsLib1:
                                                                         ViralRecombinationCount +=1
                                                                 elif Donor in cfg.RefsLib2 and Acceptor in cfg.RefsLib2:
@@ -1532,10 +1541,14 @@ def ResultsSort(File1):
                                                         HasRealEvent = True
                                                         EventType, EventSize = "UnknownInsertion", len(Insertion)
                                                         UnRec = 'Y'
+                                #Both rows for one segment describe the same point in the read, so
+                                #they share whichever sites the event was filed under.
+                                RowDonorSite = DonorSite if FiledDonorSite is None else FiledDonorSite
+                                RowAcceptorSite = AcceptorSite if FiledAcceptorSite is None else FiledAcceptorSite
                                 if EventType is not None:
-                                    WriteReadEvent(ReadName, n+1, NSegments, EventType, Donor, DonorSite, Acceptor, AcceptorSite, EventSize)
+                                    WriteReadEvent(ReadName, n+1, NSegments, EventType, Donor, RowDonorSite, Acceptor, RowAcceptorSite, EventSize)
                                 if ExtraEvent is not None:
-                                    WriteReadEvent(ReadName, n+1, NSegments, ExtraEvent[0], Donor, DonorSite, Acceptor, AcceptorSite, ExtraEvent[1])
+                                    WriteReadEvent(ReadName, n+1, NSegments, ExtraEvent[0], Donor, RowDonorSite, Acceptor, RowAcceptorSite, ExtraEvent[1])
                                 n+=1
                         if not HasRealEvent:
                                 #Every gap/event in this read fell within the MicroInDel_Length noise threshold --
