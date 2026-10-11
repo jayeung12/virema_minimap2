@@ -497,7 +497,12 @@ def FindFuzz(Donor, DonorSite, Acceptor, AcceptorSite, MaxFuzz):
         if "_RevStrand" in Donor:##This is probably more complex than it needs to be and could be revised removes _RevStrand considerations
                 Gene = Donor[:-10]
                 UpstreamDonorSeq = Rev_Comp(cfg.Genes[Gene][int(DonorSite) - 1:int(DonorSite) - 1 + MaxFuzz])
-                DownstreamDonorSeq = Rev_Comp(cfg.Genes[Gene][int(DonorSite) - 1 + MaxFuzz:int(DonorSite)])
+                #The bases the read would have continued into had it not recombined. On the minus
+                #strand the read runs down the reference, so those bases lie BELOW DonorSite and
+                #have to be taken as a descending window ending just before it. The slice this
+                #replaced ran from a higher index to a lower one and was therefore always empty,
+                #which pinned RightFuzz to 0 for every _RevStrand donor.
+                DownstreamDonorSeq = Rev_Comp(cfg.Genes[Gene][max(0, int(DonorSite) - 1 - MaxFuzz):int(DonorSite) - 1])
         else:
                 Gene = Donor
                 UpstreamDonorSeq = cfg.Genes[Gene][int(DonorSite) - MaxFuzz:int(DonorSite)]
@@ -505,7 +510,9 @@ def FindFuzz(Donor, DonorSite, Acceptor, AcceptorSite, MaxFuzz):
         if "_RevStrand" in Acceptor:
                 Gene = Acceptor[:-10]
                 UpstreamAcceptorSeq = Rev_Comp(cfg.Genes[Gene][int(AcceptorSite): int(AcceptorSite) + MaxFuzz])
-                DownstreamAcceptorSeq = Rev_Comp(cfg.Genes[Gene][int(AcceptorSite) + MaxFuzz:int(AcceptorSite)])
+                #As above, but the acceptor's downstream window starts AT the acceptor site, so the
+                #descending window ends there inclusive.
+                DownstreamAcceptorSeq = Rev_Comp(cfg.Genes[Gene][max(0, int(AcceptorSite) - MaxFuzz):int(AcceptorSite)])
         else:
                 Gene = Acceptor
                 UpstreamAcceptorSeq = cfg.Genes[Gene][int(AcceptorSite) - 1 - MaxFuzz: int(AcceptorSite) - 1]
