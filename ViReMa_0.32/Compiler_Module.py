@@ -729,6 +729,12 @@ def RecreateOldFormatfromSAM(lines):
                     CIGAR = CIGAR[2:]
                 else:
                     pass
+                #Read-derived fields are stored exactly as SEQ holds them, i.e. reference-forward,
+                #and must NOT be complemented here. Both aligners feed this function a standard SAM:
+                #the bowtie path's Rev_Comp at ViReMa.py:474 is its own internal working
+                #orientation, and CompleteSAMRead undoes it at ViReMa.py:1074-1076 before the SAM is
+                #written. Complementing here instead turned bowtie's own micro-insertion
+                #1298_AAACATGAACGAACCTGGAA_1577 into 1298_TTCCAGGTTCGTTCATGTTT_1577.
                 if CIGAR[1] == 'S':
                     line.append(Read[:int(CIGAR[0])])
                     Read = Read[int(CIGAR[0]):]

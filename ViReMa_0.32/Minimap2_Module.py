@@ -1020,6 +1020,29 @@ def _segment_strand(segment):
     return int(segment['read'][1]) & 16
 
 
+def _absolute_strand(primary_read, frame_relative_strand):
+    """Strand bit to write on an emitted record, in the ORIGINAL read's terms.
+
+    _segment_strand() is deliberately relative to the primary's SEQ frame, because that frame is
+    what every merge calculation lives in (see its docstring). But the SAM we emit is read back by
+    Compiler_Module.RecreateOldFormatfromSAM(), which needs the real strand: it is what selects the
+    '_RevStrand' reference-name convention the bowtie path produces, and so what drives the strand
+    columns of Read_Events.tsv, the Dir columns of the BEDPE, and the Copy/Snap-Back vs plain fusion
+    distinction. Composing the frame-relative strand with the primary's own strand recovers it.
+
+    Leaving this out pinned every multi-segment record to forward: measured on
+    sr90_e0.25/fhv_600bp_fwd, 50 of 116 junction reads were reverse-strand in minimap2's own output
+    and none of them kept the bit, so minimap2 mode produced no '_RevStrand' libraries at all where
+    bowtie produced three.
+
+    XOR, not OR, because a rescue segment's flag is relative to the primary's frame. For an
+    inversion the two compose to opposite strands either way round -- a plus-strand read gives
+    0^0='+' and 0^16='-', a minus-strand read of the same event gives 16^0='-' and 16^16='+' --
+    whereas pinning the main segment made both read as '+/-' and so indistinguishable.
+    """
+    return (int(primary_read[1]) & 16) ^ frame_relative_strand
+
+
 def group_contiguous_segments(segments):
     """Group segments that can be merged with N gaps based on genomic positions"""
     if not segments:
@@ -1259,8 +1282,9 @@ def create_single_merged_record_new(base_read_name, primary_read, segments, unpl
     merged_read[0] = base_read_name
     # Primary alignment, strand preserved -- group_contiguous_segments only ever groups
     # same-strand segments together, so any segment's strand bit is the whole group's strand
-    # (previously hard-coded to '0'/forward regardless of true strand).
-    merged_read[1] = str(_segment_strand(segments[0]))
+    # (previously hard-coded to '0'/forward regardless of true strand). Composed with the
+    # primary's own strand so the emitted flag is absolute; see _absolute_strand().
+    merged_read[1] = str(_absolute_strand(primary_read, _segment_strand(segments[0])))
     merged_read[2] = merged_ref_name
     merged_read[3] = str(merged_ref_pos)
     merged_read[4] = '255'  # High MAPQ
@@ -1448,7 +1472,11 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
                 first['ref_pos'] += ref_removed
                 deficit -= taken
 
-    # Now build records with correct hard clips calculated from processed operations
+    # Now build records with correct hard clips calculated from processed operations.
+    # Pre-sized because the records are placed by emission order, which is the reverse of the
+    # frame order they are built in when the primary is reverse-strand (see emit_idx below).
+    primary_strand = int(primary_read[1]) & 16
+    records = [None] * len(processed_groups)
     for group_idx, processed_group in enumerate(processed_groups):
         # Calculate directional hard clip sizes from processed CIGAR operations
         preceding_groups_length = 0
@@ -1466,11 +1494,27 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
             # Calculate query-consuming operations from processed CIGAR
             following_groups_length += sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', processed_cigar))
 
+        # Where this group's record goes in the FILE. Groups are built in seq_pos order, i.e.
+        # left-to-right along the primary's SEQ, but the old format and the bowtie path both list a
+        # read's segments in READ (5'->3') order, and for a reverse-strand primary those are
+        # opposite. Emitting in frame order left a two-segment minus-strand read reporting the
+        # junction between the wrong ends of its two blocks: read loc1_S1_253 came out as
+        # FHV_RNA1:1535 -> FHV_RNA2:324 where bowtie gives FHV_RNA2:299 -> FHV_RNA1:1598.
+        # Only the emission order is permuted -- every length, clip and position below stays in the
+        # primary's frame, which is what the hard-clip arithmetic and update_hardclipped_values()
+        # require.
+        emit_idx = (len(processed_groups) - 1 - group_idx) if primary_strand else group_idx
+
         # Create record for this group: primary vs supplementary bit, strand preserved from
-        # the group's own segments (previously hard-coded to forward regardless of true strand).
+        # the group's own segments (previously hard-coded to forward regardless of true strand)
+        # and composed with the primary's own strand so the flag is absolute -- see
+        # _absolute_strand(). Yields exactly 0/16/2048/2064, all of which
+        # RecreateOldFormatfromSAM()'s flag dispatch recognises. The non-supplementary record is
+        # the one emitted FIRST, matching bowtie (ViReMa.py gives FLAG 16 to its n == 1 segment).
         record = primary_read.copy()
         record[0] = base_read_name
-        record[1] = str((0 if group_idx == 0 else 2048) | processed_group['strand'])
+        record[1] = str((0 if emit_idx == 0 else 2048)
+                        | _absolute_strand(primary_read, processed_group['strand']))
         record[2] = processed_group['ref_name']
         record[3] = str(processed_group['ref_pos'])
         record[4] = '255'
@@ -1491,11 +1535,13 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
 
         record[5] = coalesce_cigar_ops(''.join(cigar_parts))
 
-        # Set mate information for paired records
+        # Set mate information for paired records. Keyed on emission order so the
+        # non-supplementary record points at whichever group is emitted next, not at the
+        # frame-next one. Nothing reads these -- the compiler ignores RNEXT/PNEXT and bit 1 is
+        # never set -- but leaving them frame-ordered would contradict the record order.
         if len(processed_groups) > 1:
-            if group_idx == 0:
-                # Primary points to first supplementary
-                next_group = processed_groups[1]
+            if emit_idx == 0:
+                next_group = processed_groups[group_idx - 1] if primary_strand else processed_groups[1]
                 record[6] = next_group['ref_name']
                 record[7] = str(next_group['ref_pos'])
                 record[8] = '0'
@@ -1504,12 +1550,14 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
                 record[7] = '0'
                 record[8] = '0'
 
-        # Add tags
-        fi_value = group_idx + 1
+        # Add tags. FI must be ascending in FILE order and terminate at TC, because ResultsSort()
+        # walks FI to decide how many records belong to one read -- so it counts emission order,
+        # not frame order.
+        fi_value = emit_idx + 1
         tc_value = len(processed_groups)
         tags = [f'FI:i:{fi_value}', 'NM:i:0', f'TC:i:{tc_value}']
 
-        records.append(record[:11] + tags)
+        records[emit_idx] = record[:11] + tags
 
     return records
 
