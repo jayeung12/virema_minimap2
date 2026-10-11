@@ -1352,6 +1352,53 @@ def extract_aligned_operations(cigar, accounted_softclip_positions=None, is_firs
 
     return aligned_ops
 
+def _cigar_parts_query_length(cigar_parts):
+    """Read bases consumed by a list of CIGAR fragments such as ['30M', '2I', '5S']."""
+    return sum(int(length) for length, op in re.findall(r'(\d+)([MIS=X])', ''.join(cigar_parts)))
+
+
+def _give_back_insertion_bases(processed_groups, deficit):
+    """Take over-claimed read bases off insertion operations, largest first.
+
+    An insertion CLAIMS read bases without aligning them. The merge path turns a primary's
+    trailing soft clip into one -- and that clip is the very stretch the later rescue rounds
+    realign -- so the primary goes on claiming bases that another group now also claims.
+    Handing the excess back here moves no reported coordinate, because an insertion consumes no
+    reference, and it leaves every aligned block intact. The alternative, trimming the read's
+    outer edges, can wipe out a short group completely: on SRR34426337.67635 a 735-base
+    over-claim (a 1744nt read whose groups claimed 2479) fell on a 165-base group carrying a
+    481N junction and erased it, leaving a "1744H" record that crashed the compiler.
+
+    Returns whatever deficit could not be given back.
+    """
+    candidates = []
+    for group_idx, group in enumerate(processed_groups):
+        parts = group['cigar_parts']
+        for part_idx, part in enumerate(parts):
+            match = re.fullmatch(r'(\d+)I', part)
+            # Only at a group's own edges. Shrinking an insertion in the middle would re-frame
+            # every operation after it against the read: the bases an M block is matched to
+            # would shift by what was taken, so its reported sequence would be wrong even
+            # though its coordinates are not.
+            if match and part_idx in (0, len(parts) - 1):
+                candidates.append((int(match.group(1)), group_idx, part_idx))
+    candidates.sort(reverse=True)
+    for length, group_idx, part_idx in candidates:
+        if deficit <= 0:
+            break
+        group = processed_groups[group_idx]
+        # Leave the group at least one base of the read; a record with none is not valid SAM.
+        spare = _cigar_parts_query_length(group['cigar_parts']) - 1
+        take = min(length, deficit, max(spare, 0))
+        if take <= 0:
+            continue
+        group['cigar_parts'][part_idx] = f"{length - take}I" if length > take else ''
+        deficit -= take
+    for group in processed_groups:
+        group['cigar_parts'] = [part for part in group['cigar_parts'] if part]
+    return deficit
+
+
 def create_paired_records_new(base_read_name, primary_read, contiguous_groups, unplaced_fragments=None):
     """Create paired records from multiple contiguous groups using SAM-based accounting"""
     records = []
@@ -1418,7 +1465,7 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
     # once and the insert survives into the compiler (which treats a soft clip between two
     # mapped segments as an insertion, the same as an I operation).
     full_read_length = len(primary_read[9]) if primary_read[9] not in ('', '*') else 0
-    if full_read_length and len(processed_groups) > 1:
+    if full_read_length and len(processed_groups) >= 1:
         accounted = sum(
             sum(int(l) for l, o in re.findall(r'(\d+)([MIS=X])', ''.join(g['cigar_parts'])))
             for g in processed_groups)
@@ -1441,11 +1488,21 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
                     target = min(preceding, len(processed_groups)) - 1
                     processed_groups[target]['cigar_parts'].append(f"{share}S")
         elif residual < 0:
-            # The groups claim MORE query bases than the read has, which happens on some
-            # reverse-strand reads where a clip is emitted in the wrong frame and so gets
-            # counted twice. Those bases do not exist, so trim the excess off soft clips
-            # (last first) rather than leave SEQ and CIGAR disagreeing.
+            # The groups claim MORE query bases than the read has: a clip emitted in the
+            # wrong frame on some reverse-strand reads and so counted twice, or a primary's
+            # trailing clip promoted to an insertion while the rescue rounds realign the same
+            # bases into groups of their own. Those bases do not exist, so give the excess
+            # back rather than leave SEQ and CIGAR disagreeing -- in an order that keeps every
+            # aligned block where it is and every record framed against the right read bases.
             deficit = -residual
+            # Terminal insertions first. They are where a double claim actually comes from --
+            # the merge path promotes a primary's trailing soft clip, the stretch the rescue
+            # rounds realign, into an insertion -- and shrinking one moves no coordinate and
+            # re-frames nothing. Soft clips come second because giving back a LEADING one
+            # shortens the claim without moving the record's SEQ window, which shifts the
+            # alignment against the read by what was taken: on SRR34426337.67635 that put the
+            # first 18M against the read's unaligned 118nt head.
+            deficit = _give_back_insertion_bases(processed_groups, deficit)
             for group in reversed(processed_groups):
                 parts = group['cigar_parts']
                 for j in range(len(parts) - 1, -1, -1):
@@ -1460,17 +1517,34 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
                 group['cigar_parts'] = [part for part in parts if part]
                 if deficit <= 0:
                     break
+            # Last resort: the read's own outer edges. Capped so a group always keeps at least
+            # one base of the read, because a record with none is not a valid SAM record.
             if deficit > 0:
                 last = processed_groups[-1]
-                last['cigar_parts'], taken, _ = _trim_cigar_parts_at_edge(
-                    last['cigar_parts'], deficit, from_start=False)
-                deficit -= taken
+                take = min(deficit, _cigar_parts_query_length(last['cigar_parts']) - 1)
+                if take > 0:
+                    last['cigar_parts'], taken, _ = _trim_cigar_parts_at_edge(
+                        last['cigar_parts'], take, from_start=False)
+                    deficit -= taken
             if deficit > 0:
                 first = processed_groups[0]
-                first['cigar_parts'], taken, ref_removed = _trim_cigar_parts_at_edge(
-                    first['cigar_parts'], deficit, from_start=True)
-                first['ref_pos'] += ref_removed
-                deficit -= taken
+                take = min(deficit, _cigar_parts_query_length(first['cigar_parts']) - 1)
+                if take > 0:
+                    first['cigar_parts'], taken, ref_removed = _trim_cigar_parts_at_edge(
+                        first['cigar_parts'], take, from_start=True)
+                    first['ref_pos'] += ref_removed
+                    deficit -= taken
+
+    # Nothing base-less may be emitted. A group can be left with no query-consuming operation
+    # either by the accounting map, when every base it claimed had already gone to an earlier
+    # group, or by the reconciliation above. The record built from it is hard clips only, with
+    # an empty SEQ and QUAL -- not a valid SAM record, and it crashed
+    # RecreateOldFormatfromSAM()'s CIGAR walk, which assumes an operation follows a leading
+    # hard clip (SRR34426337.67635, one read of 116,303, emitted "1744H").
+    processed_groups = [group for group in processed_groups
+                        if _cigar_parts_query_length(group['cigar_parts'])]
+    if not processed_groups:
+        return []
 
     # Now build records with correct hard clips calculated from processed operations.
     # Pre-sized because the records are placed by emission order, which is the reverse of the
