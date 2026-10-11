@@ -435,20 +435,33 @@ def AddToDict(Donor, Acceptor, DonorSite, AcceptorSite, Dict, ReadName):
                 if int(AcceptorSite) != int(DonorSite) + 1:
                         LeftFuzz, RightFuzz, uHomology = FindFuzz(Donor, DonorSite, Acceptor, AcceptorSite, (cfg.MaxFuzz+1))
                         if LeftFuzz != 0 or RightFuzz != 0:
+                                #FindFuzz() reports the fuzzy region in READ orientation: the junction
+                                #can slide LeftFuzz bases toward the read's 5' end and RightFuzz toward
+                                #its 3' end, and every placement in between describes the same read.
+                                #Defuzzing picks one of them, so choose the offset once in 3'-ward read
+                                #units and only then convert it to a reference coordinate.
+                                #
+                                #The conversion needs EACH SITE'S OWN strand, because a minus-strand
+                                #site runs the other way down the reference: sliding 3' lowers its
+                                #coordinate and sliding 5' raises it. Applying one signed shift to both
+                                #sites is only right when the two arms share a strand; on a mixed-strand
+                                #junction such as an inversion, one arm reads up the reference while the
+                                #other reads down, so the two shifts are opposite.
                                 if cfg.Defuzz == 'Centre':
-                                    if "_RevStrand" in Donor:  ##This is probably more complex than it needs to be and could be revised removes _RevStrand considerations
-                                        Fuzz = RightFuzz - LeftFuzz
-                                    else:
-                                        Fuzz = LeftFuzz - RightFuzz
-                                    ## Use of // forces odd-length Fuzz to 3' end whether Fwd or Rev strand
-                                    DonorSite = str(int(DonorSite) - (int(Fuzz//2)))
-                                    AcceptorSite = str(int(AcceptorSite) - (int(Fuzz//2)))
-                                elif cfg.Defuzz == 'Left':
-                                        DonorSite = str(int(DonorSite) - RightFuzz)
-                                        AcceptorSite = str(int(AcceptorSite) - RightFuzz)
-                                else: ##Right
-                                        DonorSite = str(int(DonorSite) + LeftFuzz)
-                                        AcceptorSite = str(int(AcceptorSite) + LeftFuzz)
+                                        ## Use of // forces an odd-length region to the 3' end
+                                        Offset = -((LeftFuzz - RightFuzz)//2)
+                                elif cfg.Defuzz == 'Left':  ##--Defuzz 5, the 5' end of the fuzzy region
+                                        Offset = -LeftFuzz
+                                else:  ##Right, --Defuzz 3, the 3' end
+                                        Offset = RightFuzz
+                                if "_RevStrand" in Donor:
+                                        DonorSite = str(int(DonorSite) - Offset)
+                                else:
+                                        DonorSite = str(int(DonorSite) + Offset)
+                                if "_RevStrand" in Acceptor:
+                                        AcceptorSite = str(int(AcceptorSite) - Offset)
+                                else:
+                                        AcceptorSite = str(int(AcceptorSite) + Offset)
                 else:
                         pass
         else:
