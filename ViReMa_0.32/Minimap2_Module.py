@@ -27,6 +27,12 @@ ALIGNER_DIRECTORY = ''  # cfg.Aligner_Directory, already formatted with a traili
 # operates on CIGAR/SAM content, not on which aligner preset produced it.
 ITERATIVE_RESCUE_TECHS = ('ont', 'pb', 'hifi')
 
+# Highest round number the iterative softclip rescue may reach (round 1 is the initial alignment,
+# so the number of rescue rounds is this minus one). Short reads also iterate, but nested
+# softclips >= Seed run out within a few rounds on ~50-150 nt reads, so they get a tighter cap.
+LONG_READ_MAX_ROUNDS = 6   # rounds 2-6: up to 5 rescue rounds
+SHORT_READ_MAX_ROUNDS = 4  # rounds 2-4: up to 3 rescue rounds
+
 # Intermediate files. Like the TEMPREADS/TEMPSAM1 files of the bowtie/bwa workflow in ViReMa.py,
 # these live in cfg.Output_Dir and are removed once alignment has finished; run_minimap2_workflow()
 # sets the real paths. INTERMEDIATE_SAM and MULTIROUND_FILE are kept when --Debug is set.
@@ -122,21 +128,16 @@ def run_minimap2_workflow(config):
                 for read_name, seq in temp_sequences:
                     f.write(f">{read_name}\n{seq}\n")
 
-            # Step 5: Run second minimap2 alignment (iterative for ont/pb/hifi)
+            # Step 5: Iterative softclip rescue, merged into INTERMEDIATE_SAM after every round.
+            # Long reads: up to LONG_READ_MAX_ROUNDS, with the embedded-insertion rewrite each
+            # round. Short reads: up to SHORT_READ_MAX_ROUNDS, no insertion rewrite (it was never
+            # applied to short reads, including round 1).
             if long_read_tech in ITERATIVE_RESCUE_TECHS:
-                run_iterative_ont_alignment(long_read_tech)
+                run_iterative_ont_alignment(long_read_tech, max_rounds=LONG_READ_MAX_ROUNDS,
+                                            rewrite_insertions=True)
             else:
-                # Plain short-read mode: run single second round
-                cmd = build_minimap2_command(TEMP_READS_FILE, long_read_tech, is_initial=False)
-                with open(TEMP_SAM_FILE, 'w') as f:
-                    subprocess.run(cmd, stdout=f, check=True)
-                print("Round 2 minimap2 alignment completed")
-
-            # Step 6: Merge results (only for the single-round fallback -- the iterative path
-            # merges internally after every round)
-            if long_read_tech not in ITERATIVE_RESCUE_TECHS:
-                merge_temp_sam_to_output(TEMP_SAM_FILE)
-                print(f"Results merged back into {INTERMEDIATE_SAM} with grouped reads")
+                run_iterative_ont_alignment(long_read_tech, max_rounds=SHORT_READ_MAX_ROUNDS,
+                                            rewrite_insertions=False)
 
         # Step 7: Convert to ViReMa format
         convert_to_virema_format()
@@ -252,32 +253,18 @@ def parse_sam_for_softclipped(long_read_tech=None):
         read_name = fields[0]
         read_alignments[read_name].append(fields)
 
-    # Process alignments based on technology
+    # Keep the alignment with the highest AS score (all technologies, short reads included).
+    # max() returns the first of equal scores, so ties still fall to minimap2's own primary,
+    # which it writes first.
     softclipped_reads = {}
     for read_name, alignment_list in read_alignments.items():
-        if long_read_tech in ITERATIVE_RESCUE_TECHS:
-            # For ont/pb/hifi, keep alignment with highest AS score
-            def get_as_score(fields):
-                for field in fields[11:]:
-                    if field.startswith('AS:i:'):
-                        return int(field.split(':')[2])
-                return 0
-            best_alignment = max(alignment_list, key=get_as_score)
-            softclipped_reads[read_name] = {
-                'line': '\t'.join(best_alignment),
-                'cigar': best_alignment[5],
-                'sequence': best_alignment[9],
-                'ins_len': _get_ins_len_tag(best_alignment)
-            }
-        else:
-            # For other technologies, use the first alignment
-            fields = alignment_list[0]
-            softclipped_reads[read_name] = {
-                'line': '\t'.join(fields),
-                'cigar': fields[5],
-                'sequence': fields[9],
-                'ins_len': _get_ins_len_tag(fields)
-            }
+        best_alignment = max(alignment_list, key=get_as_score_from_read_fields)
+        softclipped_reads[read_name] = {
+            'line': '\t'.join(best_alignment),
+            'cigar': best_alignment[5],
+            'sequence': best_alignment[9],
+            'ins_len': _get_ins_len_tag(best_alignment)
+        }
 
     return softclipped_reads
 
@@ -449,23 +436,30 @@ def rewrite_embedded_insertions_as_softclips(sam_file, microindel_threshold, see
         f.writelines(out_lines)
 
 
-def run_iterative_ont_alignment(long_read_tech='ont'):
-    """Run iterative alignment rounds (ont/pb/hifi) until convergence"""
+def run_iterative_ont_alignment(long_read_tech='ont', max_rounds=LONG_READ_MAX_ROUNDS,
+                                rewrite_insertions=True):
+    """Run iterative softclip-rescue rounds until no new softclips >= Seed appear or round
+    `max_rounds` has run (round 1 is the initial alignment, so this allows max_rounds - 1 rescue
+    rounds). Used for every technology: long_read_tech=None is short-read mode, which uses the
+    short-read rescue preset and passes rewrite_insertions=False.
+
+    The long-read limit (6) is a safety bound -- successful rescues were observed to converge by
+    round 3-4, so it caps worst-case cost for reads that never resolve without affecting reads
+    that do."""
     round_num = 2
-    max_rounds = 6  # Safety limit to prevent infinite loops -- successful rescues observed to
-                     # converge by round 3-4, so this bounds worst-case cost for reads that
-                     # never resolve without affecting reads that do
     current_temp_file = TEMP_READS_FILE
     temp_sam_file = TEMP_SAM_FILE
+    mode_label = long_read_tech if long_read_tech else 'short-read'
 
-    print(f"Starting iterative {long_read_tech} alignment process...")
+    print(f"Starting iterative {mode_label} alignment process (up to round {max_rounds})...")
 
     # Run initial second round alignment
     cmd = build_minimap2_command(current_temp_file, long_read_tech, is_initial=False)
     with open(temp_sam_file, 'w') as f:
         subprocess.run(cmd, stdout=f, check=True)
     print("Round 2 minimap2 alignment completed")
-    rewrite_embedded_insertions_as_softclips(temp_sam_file, MICROINDEL_THRESHOLD, SEED_THRESHOLD)
+    if rewrite_insertions:
+        rewrite_embedded_insertions_as_softclips(temp_sam_file, MICROINDEL_THRESHOLD, SEED_THRESHOLD)
 
     # Process alignment results and merge into the intermediate SAM
     merge_temp_sam_to_output(temp_sam_file)
@@ -527,7 +521,8 @@ def run_iterative_ont_alignment(long_read_tech='ont'):
         with open(temp_sam_file, 'w') as f:
             subprocess.run(cmd, stdout=f, check=True)
         print(f"Round {round_num} minimap2 alignment completed")
-        rewrite_embedded_insertions_as_softclips(temp_sam_file, MICROINDEL_THRESHOLD, SEED_THRESHOLD)
+        if rewrite_insertions:
+            rewrite_embedded_insertions_as_softclips(temp_sam_file, MICROINDEL_THRESHOLD, SEED_THRESHOLD)
 
         # Process and merge results
         merge_temp_sam_to_output(temp_sam_file)

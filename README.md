@@ -46,7 +46,7 @@ classification during compilation.
 
 Before softclip extraction, any large embedded `I` (insertion) CIGAR operation -- minimap2's usual way of representing a chimeric/foreign-content read as one alignment rather than splitting it -- is rewritten into an explicit trailing softclip (`rewrite_embedded_insertions_as_softclips`), run on every round's output for all three long-read techs. This is what lets the softclip-rescue pipeline below discover chimeric junctions that minimap2 never actually soft-clipped in the first place (cross-locus insertions, cross-segment fusions, tandem duplications, inversions all commonly present this way).
 
-Only the alignment with the highest alignment score has its softclips sent for additional rounds of alignment. Iterative re-alignment now runs identically for all three long-read technologies (`ITERATIVE_RESCUE_TECHS = ('ont','pb','hifi')`) -- earlier, PacBio CLR/HiFi used a single non-iterated round and reused the whole-read preset for softclip rescue, which failed outright on short extracted fragments; both are now unified with ONT's iterative, short-fragment-tuned rescue. Max rounds is 6 (successful rescues converge by round 3-4 in practice).
+Only the alignment with the highest alignment score has its softclips sent for additional rounds of alignment (all modes, short reads included). Iterative re-alignment now runs identically for all three long-read technologies (`ITERATIVE_RESCUE_TECHS = ('ont','pb','hifi')`) -- earlier, PacBio CLR/HiFi used a single non-iterated round and reused the whole-read preset for softclip rescue, which failed outright on short extracted fragments; both are now unified with ONT's iterative, short-fragment-tuned rescue. Max rounds is 6 for long reads (`LONG_READ_MAX_ROUNDS`; successful rescues converge by round 3-4 in practice). Short reads use the same iterative loop, capped at round 4 (`SHORT_READ_MAX_ROUNDS`, i.e. up to 3 rescue rounds), with their own rescue preset and without the embedded-insertion rewrite.
 
 ### 2. Softclip Extraction and Re-alignment
 - **Extraction**: Identifies softclipped sequences ≥ threshold length (Seed parameter) from primary alignments
@@ -75,7 +75,7 @@ Sometimes, mapping softclips will have further softclips that exceed threshold l
 #### Selecting Among Several Candidate Alignments
 Before a read reaches the single/multiple classification below, there are three separate points where the pipeline has to pick among competing candidate alignments for the same read or softclip fragment, each with different rules:
 
-1. **Round-1 multi-primary (`parse_sam_for_softclipped`)**: covered above (line 49) -- for the iterative long-read techs, if round 1 produced more than one primary-like record for a read, only the highest-`AS:i:`-scoring one has its softclips queued for rescue.
+1. **Round-1 multi-primary (`parse_sam_for_softclipped`)**: covered above (line 49) -- in every mode (short reads included), if round 1 produced more than one primary-like record for a read, only the highest-`AS:i:`-scoring one has its softclips queued for rescue.
 2. **Merging a rescue round back in (`select_alignments_for_identifier`)**: when a softclip identifier comes back from a rescue round with several competing records, the best-scoring PRIMARY record is kept **together with every SUPPLEMENTARY record** (`FLAG & 2048`) -- supplementaries are never dropped in favor of a single best-AS winner, since a genuine chimeric/split alignment needs all of its pieces. Only genuinely-competing SECONDARY records (`FLAG & 256`) are discarded. If no primary exists at all among the candidates (rare), this falls back to plain single-best-AS across everything.
 3. **Classifying records for the final conversion (`merge_split_alignments`)**: records are bucketed into "softclip segment" (name contains `_softclip_`) or "primary candidate" (no `_softclip_` in the name, not secondary/supplementary); the primary candidate with the highest `AS:i:` becomes the main alignment. **Known gap**: a record that IS supplementary but does NOT have `_softclip_` in its name -- i.e. a genuine round-1 primary+supplementary pair minimap2 already got right on its own -- matches neither bucket and is silently dropped. This only surfaces when the same read also needs rescue somewhere else (so round 1's output for that read is a mix of clean primary+supplementary plus still-unresolved softclips); see "Mechanism B" under Recent Changes below. Separately, if one softclip position ever collects 3+ candidate records (only possible via the insertion/rest 2-way split producing an unexpected extra fragment), the code falls back to plain single-best-AS across all of them rather than guessing at an N-way merge order.
 
@@ -142,6 +142,19 @@ Validated via a 120+ run synthetic benchmark suite (deletions, tandem duplicatio
 cross-segment insertions, same-chromosome cross-locus insertions, and an edge-of-reference
 proximity sweep, each across ONT/PacBio CLR/PacBio HiFi) -- see that suite's own README for
 methodology and numbers.
+
+- **Short-read mode now selects by best AS and iterates up to 3 rescue rounds**
+  (`Minimap2_Module.py`): round-1 softclip selection used the first non-supplementary record for
+  short reads and best-`AS:i:` only for long reads; it is now best-`AS:i:` everywhere (ties still
+  go to minimap2's primary, which it writes first). Short reads also realigned softclips exactly
+  once, so a rescued clip's own clip >= Seed was never placed; they now run through the same
+  iterative loop as long reads, capped at round 4 (`SHORT_READ_MAX_ROUNDS`), without the
+  long-read-only embedded-insertion rewrite. On `Test_Data/FHV_10k.txt` (`--Seed 25
+  --MicroInDel_Length 20`): the selected record was unchanged for all 7,305 rescued reads, 5
+  nested clips reached round 3 and the loop converged there, 4 of them were deduplicated against
+  their parent's own supplementary, and 1 read gained a placed 25-nt tail
+  (`40M960N25M25S` -> `40M960N25M12N25M`, one new micro-deletion). Long-read output and the
+  250-read `FHV_small.txt` output are byte-identical to before.
 
 - **Insertions sitting at a recombination junction are now reported** (`Minimap2_Module.py`,
   `Compiler_Module.py`): an insert only ever reached `Virus_Insertions.txt` and

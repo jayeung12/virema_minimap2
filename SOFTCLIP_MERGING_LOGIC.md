@@ -230,8 +230,7 @@ placement in the disputed region is correct).
   with the highest AS (alignment score) as that identifier's best primary; any supplementary
   companions for the same identifier are kept alongside it, not discarded.
 - Selecting the base read's own main alignment among multiple primary-like candidates (e.g. ONT/
-  PacBio's highest-AS softclip selection, vs. short-read's first-record selection) works the same
-  way, one level up.
+  PacBio/short-read highest-AS softclip selection) works the same way, one level up.
 
 ## Key Considerations
 
