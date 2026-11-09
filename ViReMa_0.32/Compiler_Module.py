@@ -1482,8 +1482,46 @@ def ResultsSort(File1):
                                                 #Virus_Insertions.txt was one whose flanks happened to be adjacent. A 577nt
                                                 #reporter cassette between two flanks 656nt apart was therefore invisible while
                                                 #an 88nt insert between adjacent flanks was reported normally.
+                                                #
+                                                #This junction-with-insert reporting is LONG-READ ONLY (-lr ont/pb/hifi). Short
+                                                #reads keep the original handling below, unchanged. Trade-off measured on 90bp
+                                                #simulated reads (bowtie, Seed 25, 1% error): reporting these junctions for short
+                                                #reads added 196 true calls and 223 false ones. 211 of the false ones were FHV
+                                                #homopolymer reads inside the reference's poly-A padding, where every seed maps
+                                                #anywhere and one sequencing error splits the read into two arbitrarily placed
+                                                #segments; 133 of the true ones were clean SARS-CoV-2 junctions. Short-read
+                                                #minimap2 changed by <= 2 calls per event type.
+                                                ShortReadHandled = False
+                                                if not cfg.LongReadTech:
+                                                        ShortReadHandled = True
+                                                        if len(Insertion) >= int(cfg.Seed) or len(Insertion) >= int(cfg.Host_Seed):
+                                                                #Mapable Insertion/Recombination
+                                                                UnknownRecombinationCount += 1
+                                                                HasRealEvent = True
+                                                                EventType, EventSize = "UnknownRecombination", len(Insertion)
+                                                                UnRec = 'Y'
+                                                        elif cfg.Compound_Handling and len(Insertion) > int(cfg.Compound_Handling) and Donor == Acceptor and Donor in cfg.RefsLib1:
+                                                                #Compound Recombination
+                                                                CompoundCount += 1
+                                                                CompTest = Compound_Handling_Script(Donor, DonorSite, Insertion, AcceptorSite, uDelDicts, RecDicts, ReadName)
+                                                                if CompTest == "HIT":
+                                                                        RecombCount += 2
+                                                                        ViralRecombinationCount += 2
+                                                                        CompoundCount += 1
+                                                                        HasRealEvent = True
+                                                                else:
+                                                                        #Unknown Compound
+                                                                        UnRec = 'Y'
+                                                                        UnknownRecombinationCount += 1
+                                                                        HasRealEvent = True
+                                                        else:
+                                                                #Unknown Insertion.
+                                                                UnknownRecombinationCount += 1
+                                                                HasRealEvent = True
+                                                                EventType, EventSize = "UnknownInsertion", len(Insertion)
+                                                                UnRec = 'Y'
                                                 CompoundResolved = False
-                                                if cfg.Compound_Handling and len(Insertion) > int(cfg.Compound_Handling) and Donor == Acceptor and Donor in cfg.RefsLib1:
+                                                if not ShortReadHandled and cfg.Compound_Handling and len(Insertion) > int(cfg.Compound_Handling) and Donor == Acceptor and Donor in cfg.RefsLib1:
                                                         #The insert was found in the reference between the two flanks, so it is
                                                         #not inserted sequence at all -- it resolves into two junctions.
                                                         CompoundCount += 1
@@ -1493,7 +1531,7 @@ def ResultsSort(File1):
                                                                 CompoundCount += 1
                                                                 HasRealEvent = True
                                                                 CompoundResolved = True
-                                                if CompoundResolved:
+                                                if ShortReadHandled or CompoundResolved:
                                                         pass
                                                 elif (Donor in cfg.RefsLib1 or Donor in cfg.RefsLib2) and (Acceptor in cfg.RefsLib1 or Acceptor in cfg.RefsLib2):
                                                         #Classify the underlying junction by its own jump size. Computed once so that
