@@ -1865,7 +1865,34 @@ def _is_ins_split_sibling(name_a, name_b):
     return name_a == name_b + '_ins' or name_b == name_a + '_ins'
 
 
-def _dedupe_redundant_segments(segments):
+_TREE_STEP = re.compile(r'_softclip_([01])(_ins)?')
+
+
+def _tree_order_key(read_name, base_read_name):
+    """Exact read-order sort key for a soft-clip piece, from its name alone.
+
+    Each `_softclip_0` step is -1 and each `_softclip_1` step +1, and a piece's key is its path
+    followed by 0, compared lexicographically, so for any piece X:
+        [X_softclip_0 subtree] < X < [X_softclip_1 subtree]
+    An insert split off a trailing clip (`<P>_softclip_1_ins`, see _softclip_candidates_for_record)
+    is the FIRST part of that clip by construction, so it gets -2 at that level: after P and before
+    every piece of the rest `<P>_softclip_1`, including the rest's own leading clips.
+
+    This replaces sorting by calculate_sequence_position(), whose single float ignores the `_ins`
+    suffix (an insert and its rest share one position) and cannot place an insert ahead of the
+    rest's leading clips. Ordering from the names needs no sequence search, so it also works when
+    the insert's sequence occurs twice in the read (a tandem duplication, a perfect hairpin).
+    """
+    path = read_name[len(base_read_name):] if read_name.startswith(base_read_name) else read_name
+    key = []
+    for m in _TREE_STEP.finditer(path):
+        key.append(-1 if m.group(1) == '0' else 1)
+        if m.group(2):
+            key.append(-2)
+    return tuple(key) + (0,)
+
+
+def _dedupe_redundant_segments(segments, read_sequence=''):
     """Drop softclip segments that substantially overlap another segment already kept, on the
     same reference -- keeping whichever has more aligned query bases. Only fires on genuinely
     high reciprocal overlap (>50% of the smaller segment's reference span); segments that only
@@ -1887,6 +1914,13 @@ def _dedupe_redundant_segments(segments):
                 continue
             if _is_ins_split_sibling(seg['read'][0], other['read'][0]):
                 continue
+            # Two pieces are only redundant if they also cover the same READ bases. Different stretches
+            # of the read mapping to the same reference span is not redundancy: it is exactly what a
+            # tandem duplication looks like (both copies align to the duplicated region).
+            if read_sequence:
+                loc_a, loc_b = _locate_record(seg['read'], read_sequence), _locate_record(other['read'], read_sequence)
+                if loc_a and loc_b and min(loc_a[1], loc_b[1]) - max(loc_a[0], loc_b[0]) <= 0:
+                    continue
             other_span = _ref_span(other['cigar'])
             other_start, other_end = other['ref_pos'], other['ref_pos'] + other_span
             overlap = min(seg_end, other_end) - max(seg_start, other_start)
@@ -2272,7 +2306,14 @@ def merge_split_alignments(base_read_name, reads):
             # Parse softclip path to get sequence position
             sequence_position = get_sequence_position_for_read(read_name, base_read_name, None)
             if sequence_position is not None and flag & 4 == 0:  # Only if aligned
-                softclip_reads.setdefault(sequence_position, []).append(read)
+                # One slot per piece (identifier). Keying by the name-derived position alone pooled an
+                # insert with its "rest" sibling (calculate_sequence_position ignores `_ins`), and once
+                # that slot held 3+ records the single-best-AS fallback below discarded the insert --
+                # which is the piece carrying a duplication's or inversion's junction. The tiny offset
+                # keeps the float position (still used to place unplaced fragments) insert-first.
+                if read_name.endswith('_ins'):
+                    sequence_position -= 1e-7
+                softclip_reads.setdefault((sequence_position, read_name), []).append(read)
             elif sequence_position is not None and (flag & 4) and read[9] not in ('', '*'):
                 unplaced_fragments.append((sequence_position, len(read[9])))
         elif not (flag & 4) and not (flag & 2048):  # Primary alignment candidate
@@ -2306,7 +2347,7 @@ def merge_split_alignments(base_read_name, reads):
     # identifier's own realignment can itself split into primary+supplementary -- both must be
     # kept as their own segments (not collapsed to one), correctly ordered and with the query
     # territory each of them claims made non-overlapping.
-    for seq_pos, reads_at_pos in softclip_reads.items():
+    for (seq_pos, _identifier), reads_at_pos in softclip_reads.items():
         if len(reads_at_pos) == 1:
             r = reads_at_pos[0]
             segments.append({
@@ -2350,7 +2391,7 @@ def merge_split_alignments(base_read_name, reads):
     # essentially the same locus that its own parent's supplementary alignment already found
     # (they come from different softclip identifiers/positions, so nothing earlier catches
     # this). Only applied to genuinely high-overlap pairs; low/partial overlap is left alone.
-    segments = _dedupe_redundant_segments(segments)
+    segments = _dedupe_redundant_segments(segments, primary_read[9] if primary_read[9] not in ('', '*') else '')
 
     # Step 2c: Two records of one chimeric alignment can claim the same query bases (the
     # junction's ambiguous region). Resolve that before any arithmetic is derived from their
@@ -2358,7 +2399,9 @@ def merge_split_alignments(base_read_name, reads):
     segments = _resolve_query_overlaps(segments, primary_read[9] if primary_read[9] not in ('', '*') else '')
 
     # Step 3: Sequence ordering - sort by sequence position
-    segments.sort(key=lambda x: x['seq_pos'])
+    # Pieces with the same name (one identifier's primary + supplementary) keep their order from
+    # Step 2, since the sort is stable.
+    segments.sort(key=lambda x: (0,) if x['type'] == 'main' else _tree_order_key(x['read'][0], base_read_name))
 
     # Step 4: Genomic merging - group contiguous segments
     contiguous_groups = group_contiguous_segments(segments)
