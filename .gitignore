@@ -8,6 +8,10 @@ ViReMa_0.32/Test_Data/*
 !ViReMa_0.32/Test_Data/FHV_*.mmi
 !ViReMa_0.32/Test_Data/FHV_*.ebwt
 
+# Keep long-read example files used in the README
+!ViReMa_0.32/Test_Data/ont_reads_0001.fq
+!ViReMa_0.32/Test_Data/pacbio_reads_0001.fq
+
 # Ignore FHV_nanopore specifically
 ViReMa_0.32/Test_Data/FHV_nanopore*
 
