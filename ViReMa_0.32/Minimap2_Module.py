@@ -1943,6 +1943,49 @@ def _rev_comp(sequence):
     return sequence.translate(_COMPLEMENT)[::-1]
 
 
+# (record name, strand bit) -> whether that record's SEQ is reverse-complemented relative to the
+# base read's frame. Filled per read by merge_split_alignments(); consulted only to break a tie.
+_EXPECTED_FLIP = {}
+
+
+def _parent_piece(name):
+    """The query a soft-clip piece was cut from: its name minus the last _softclip_<d>[_ins] step."""
+    return re.sub(r'_softclip_[01](_ins)?$', '', name)
+
+
+def _expected_flips(base_read_name, reads):
+    """Orientation of every record of one read relative to the base frame (the primary's SEQ),
+    derived from how each piece was made rather than by searching for its sequence.
+
+    A round-1 piece is cut from the primary's own SEQ, so its query is in the base frame. A nested
+    piece is cut from its parent's primary record AS STORED, which is the reverse complement of the
+    parent's query when that record is on the minus strand. A record's SEQ is then its query, or its
+    reverse complement when the record itself is on the minus strand."""
+    primary_strand = {}
+    for r in reads:
+        flag = int(r[1])
+        if '_softclip_' in r[0] and not flag & (4 | 256 | 2048):
+            primary_strand[r[0]] = flag & 16
+    query_flip = {}
+    def flip_of_query(name):
+        if name not in query_flip:
+            parent = _parent_piece(name)
+            if parent == base_read_name:
+                query_flip[name] = 0
+            elif parent in primary_strand and flip_of_query(parent) is not None:
+                query_flip[name] = flip_of_query(parent) ^ primary_strand[parent]
+            else:
+                query_flip[name] = None
+        return query_flip[name]
+    expected = {}
+    for r in reads:
+        if '_softclip_' in r[0] and not int(r[1]) & 4:
+            q = flip_of_query(r[0])
+            if q is not None:
+                expected[(r[0], int(r[1]) & 16)] = bool(q ^ (int(r[1]) & 16))
+    return expected
+
+
 def _locate_record(read_fields, read_sequence):
     """Where this record's ALIGNED block sits in the base read's own coordinates, plus the frame
     details needed to walk its CIGAR there.
@@ -1958,9 +2001,11 @@ def _locate_record(read_fields, read_sequence):
     unaligned flanks hard-clipped away so they are missing from SEQ entirely). But every
     fragment's SEQ is by construction a substring of the base read, so locating it gives the
     frame's offset exactly; `_true_query_start` then gives the aligned block's offset within
-    that frame in the read's own orientation. Fragments are hundreds of bases long, so the
-    match is unique in practice -- a sequence that occurs more than once, or not at all, gives
-    up rather than guessing.
+    that frame in the read's own orientation. A sequence that occurs more than once in one
+    orientation, or not at all, gives up rather than guessing. One that occurs once in EACH
+    orientation -- an inverted repeat, such as a short read across a perfect hairpin -- is placed
+    in the orientation the piece was made in (_EXPECTED_FLIP); without that, the first match won
+    and a hairpin's rescued arm landed inside the opposite arm.
     """
     sequence = read_fields[9]
     if not read_sequence or sequence in ('', '*'):
@@ -2003,10 +2048,17 @@ def _locate_record(read_fields, read_sequence):
     # take the one that actually occurs. A record whose SEQ is reverse-complemented relative to
     # the base frame has its own leading clip at the base frame's right-hand end, so its
     # aligned block starts at its own TRAILING clip there.
-    for flipped in (False, True):
+    candidates = [flipped for flipped in (False, True)
+                  if read_sequence.count(_rev_comp(sequence) if flipped else sequence) == 1]
+    if len(candidates) == 2:
+        # The sequence occurs once in EACH orientation: the read holds an inverted repeat, as a
+        # perfect hairpin does. Searching cannot tell the two apart, and taking the first one put a
+        # hairpin's rescued arm inside the opposite arm, where _resolve_query_overlaps deleted it.
+        # Use the orientation the piece was actually made in (see _expected_flip) instead.
+        expected = _EXPECTED_FLIP.get((read_fields[0], int(read_fields[1]) & 16))
+        candidates = [expected] if expected is not None else candidates[:1]
+    for flipped in candidates[:1]:
         oriented = _rev_comp(sequence) if flipped else sequence
-        if read_sequence.count(oriented) != 1:
-            continue
         start = read_sequence.find(oriented) + (trail if flipped else lead)
         return start, start + _aligned_query_len(read_fields[5]), flipped, lead
     return None
@@ -2325,6 +2377,11 @@ def merge_split_alignments(base_read_name, reads):
 
     if not primary_read:
         return None
+
+    # Orientation of each rescued piece, known from how it was made; breaks _locate_record's tie
+    # when a piece's sequence occurs in the read in both orientations.
+    global _EXPECTED_FLIP
+    _EXPECTED_FLIP = _expected_flips(base_read_name, reads)
 
     # Step 2: Create segments for sequence ordering
     segments = []
