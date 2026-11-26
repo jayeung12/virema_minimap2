@@ -25,11 +25,17 @@ from os import makedirs
 import argparse
 import ConfigViReMa as cfg
 from math import fabs
-from re import finditer, findall
+from re import finditer, findall, search
 import time
 import numpy as np
 from subprocess import check_output
 SamHeaders = ['@HD', '@SQ', '@RG', '@PG', '@CO']
+
+def SegmentTag(line, tag):
+    #Value of an integer SAM tag such as TC:i:12 or FI:i:3. Reading the single character after
+    #'TC:i:' took only the first digit, so a read written as 10+ records (long reads in minimap2
+    #mode) was read as TC:i:1 and each of its records compiled as a separate read.
+    return int(search(r'(?:^|\t)' + tag + r':i:(\d+)', line).group(1))
 cfg.ScrutSAM = False
 start = time.time()
 
@@ -107,13 +113,13 @@ def UniquifyReport(FileIn, FileOut):
                 n+=1
                 UniqueData = line.split()[1:9]
                 if 'TC:i:' in line:
-                    NSegs = int(line[line.index('TC:i:') + 5])
-                    CurrentSeg = int(line[line.index('FI:i:') + 5])
+                    NSegs = SegmentTag(line, 'TC')
+                    CurrentSeg = SegmentTag(line, 'FI')
                     while CurrentSeg < NSegs:
                         newline = InputData.readline()
                         line += newline
                         UniqueData += newline[1:9]
-                        CurrentSeg = int(newline[newline.index('FI:i:') + 5])
+                        CurrentSeg = SegmentTag(newline, 'FI')
                 UniqueData = '\t'.join(UniqueData)
                 if UniqueData not in TempSet:
                     DeDupedData.write(line)
@@ -1256,11 +1262,11 @@ def ResultsSort(File1):
                 lines = [wholeline.split("\t")]
                 Totalcount += 1
                 if 'TC:i:' in wholeline:
-                    NSegs = int(wholeline[wholeline.index('TC:i:') + 5])
-                    CurrentSeg = int(wholeline[wholeline.index('FI:i:') + 5])
+                    NSegs = SegmentTag(wholeline, 'TC')
+                    CurrentSeg = SegmentTag(wholeline, 'FI')
                     while CurrentSeg < NSegs:
                         wholeline = InRecombs.readline()
-                        CurrentSeg = int(wholeline[wholeline.index('FI:i:') + 5])
+                        CurrentSeg = SegmentTag(wholeline, 'FI')
                         lines.append(wholeline.split("\t"))
                 else:
                     pass
