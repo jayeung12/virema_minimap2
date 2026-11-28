@@ -756,11 +756,7 @@ def RecreateOldFormatfromSAM(lines):
                 else:
                     pass
                 #Read-derived fields are stored exactly as SEQ holds them, i.e. reference-forward,
-                #and must NOT be complemented here. Both aligners feed this function a standard SAM:
-                #the bowtie path's Rev_Comp at ViReMa.py:474 is its own internal working
-                #orientation, and CompleteSAMRead undoes it at ViReMa.py:1074-1076 before the SAM is
-                #written. Complementing here instead turned bowtie's own micro-insertion
-                #1298_AAACATGAACGAACCTGGAA_1577 into 1298_TTCCAGGTTCGTTCATGTTT_1577.
+                #and must NOT be complemented here.
                 if CIGAR[1] == 'S':
                     line.append(Read[:int(CIGAR[0])])
                     Read = Read[int(CIGAR[0]):]
@@ -906,7 +902,6 @@ def ResultsSort(File1):
                             y = []
                     if len(Genes) == 2 and Genes[0] != Genes[1]:
                         ##Copy-Back or gene fusion
-                        ##Use BEDPE format(SMC-RNA)
                         if Genes[0][-10:] == "_RevStrand":
                             Genes[0] = Genes[0][:-10]
                             Dir1 = '-'
@@ -1032,34 +1027,11 @@ def ResultsSort(File1):
                                     NAME = 'Back-Splice'
                         else:
                             pass
-                        #BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
-                        #A single-interval BED row names ONE reference, so both of its
-                        #coordinates have to belong to that reference. A cross-segment junction
-                        #(and any insert recorded at one) has an acceptor coordinate on a
-                        #different segment, which is meaningless in this row and indexes past the
-                        #end of the reference array in BEDGraph_Plot(). Such events are already
-                        #written to the BEDPE file, which can express two references, so skip
-                        #them here rather than emitting a row no consumer can read. This is the
-                        #guard the original author had sketched out on this line but left
-                        #commented; it only became reachable once junctions carrying an insert
-                        #stopped being discarded into the UnknownRecombination counter.
+
                         RefLength = len(cfg.Genes.get(Genes[0], ''))
                         SingleIntervalOK = (len(Genes) < 2 or Genes[0] == Genes[1]) and (
                             RefLength == 0 or (int(Entry[0]) <= RefLength and int(Entry[2]) <= RefLength))
-                        #An insertion dict entry is keyed on the flanks the insert sits between.
-                        #Those used to be adjacent by construction, which is what makes the
-                        #interval below one base wide and the 'Ins:' name above reachable. An
-                        #insert at a recombination junction carries that JUNCTION's flanks
-                        #instead, so the interval would span the whole junction and be named by
-                        #its coordinates -- a second, duplicate copy of the row the junction
-                        #already wrote from RecDicts, and in the uIns case a junction-wide span
-                        #in the MicroRecombinations file. The junction's own row covers the
-                        #interval; the inserted sequence is kept in the Virus_*Insertions.txt
-                        #files and in Read_Events.tsv, so skip the redundant interval here.
-                        #This has to be the SAME condition that makes the 'Ins:' name reachable
-                        #above, not merely |Stop - Start| == 1: a one-base OVERLAP is adjacent by
-                        #that looser test but is named 'Duplication', so it would still collide
-                        #with the junction's own row.
+
                         FlanksAdjacent = (Stop == Start + 1) if Dir == '+' else (Stop == Start - 1)
                         if TargetFile == VirusRecs and SingleIntervalOK:
                             BED_OUTPUT = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (Genes[0], Entry[0], Entry[2], NAME, Entry[4], Dir, LeftCount, RightCount, DonorLeftSeq + "|" + DonorRightSeq, AcceptorLeftSeq + "|" + AcceptorRightSeq)
@@ -1477,26 +1449,6 @@ def ResultsSort(File1):
                                                     EventType, EventSize = "Substitution", len(Insertion)
                                                     AddInsToDict(Donor, AcceptorSite, DonorSite, Insertion, SubDicts, ReadName)
                                         else:
-                                                #Insert sitting between two mapped segments whose flanking coordinates are NOT
-                                                #contiguous: that is a junction which carries inserted sequence. Report BOTH --
-                                                #the junction, classified by its own jump size exactly as the clean-adjacency
-                                                #branch above does, and the insert itself as its own event in read order.
-                                                #
-                                                #Previously any insert >= Seed was routed to the UnknownRecombination counter,
-                                                #whose output file is commented out, so a real junction AND real inserted
-                                                #sequence were both discarded; the only insert that ever reached
-                                                #Virus_Insertions.txt was one whose flanks happened to be adjacent. A 577nt
-                                                #reporter cassette between two flanks 656nt apart was therefore invisible while
-                                                #an 88nt insert between adjacent flanks was reported normally.
-                                                #
-                                                #This junction-with-insert reporting is LONG-READ ONLY (-lr ont/pb/hifi). Short
-                                                #reads keep the original handling below, unchanged. Trade-off measured on 90bp
-                                                #simulated reads (bowtie, Seed 25, 1% error): reporting these junctions for short
-                                                #reads added 196 true calls and 223 false ones. 211 of the false ones were FHV
-                                                #homopolymer reads inside the reference's poly-A padding, where every seed maps
-                                                #anywhere and one sequencing error splits the read into two arbitrarily placed
-                                                #segments; 133 of the true ones were clean SARS-CoV-2 junctions. Short-read
-                                                #minimap2 changed by <= 2 calls per event type.
                                                 ShortReadHandled = False
                                                 if not cfg.LongReadTech:
                                                         ShortReadHandled = True
@@ -1548,15 +1500,6 @@ def ResultsSort(File1):
                                                                 JumpSize = int(DonorSite) - int(AcceptorSite) - 1
                                                         else:
                                                                 JumpSize = int(AcceptorSite) - int(DonorSite) - 1
-                                                        #A small jump EITHER WAY is a micro-event, not a recombination. Testing
-                                                        #only 0 < JumpSize caught deletions but promoted the overlap geometry
-                                                        #(JumpSize < 0, flanks overlapping by a few bases) to Recombination,
-                                                        #which is what the pre-existing code classified as a MicroInsertion via
-                                                        #fabs(). Benchmark ground truth showed that promotion producing calls
-                                                        #like "27919 -> 27919 size=-1" -- a one-base overlap reported as a
-                                                        #junction. Mirror the original fabs() test, including its reference-
-                                                        #derived content for the duplicated span, so only a jump that really
-                                                        #exceeds the noise threshold becomes a Recombination.
                                                         if Donor == Acceptor and fabs(JumpSize) <= cfg.MicroInDel_Length:
                                                                 if JumpSize > 0:
                                                                         uCount += 1
@@ -1585,17 +1528,6 @@ def ResultsSort(File1):
                                                                         HostRecombinationCount += 1
                                                                 else:
                                                                         ViraltoHostRecombinationCount += 1
-                                                        #Record the insert itself, whatever the junction turned out to be, so it is
-                                                        #visible both in Virus_Insertions.txt and as its own ordered row.
-                                                        #
-                                                        #The micro boundary is inclusive: every gap test in this file asks
-                                                        #"<= MicroInDel_Length", and the summary line printed at the end says
-                                                        #MicroIndels are those "less than or equal to" the threshold. The two
-                                                        #insertion branches above asked ">=" instead, so with --MicroInDel_Length 20
-                                                        #a 20nt DELETION was a MicroDeletion while a 20nt INSERTION was a full
-                                                        #Insertion -- the same size on opposite sides of the same threshold. Use
-                                                        #">" here and in those branches so both event families agree. With the
-                                                        #default threshold of 0 nothing changes: an insert is never 0nt long.
                                                         if len(Insertion) > cfg.MicroInDel_Length:
                                                                 InsCount += 1
                                                                 HasRealEvent = True
@@ -1765,7 +1697,7 @@ def ResultsSort(File1):
                 pass
 
 ##      -------------------------------------------------------------------------------------------
-##      This module can be run seperately from the main ViReMa script. This may be useful when tweeking variables such
+##      This module can be run separately from the main ViReMa script. This may be useful when tweaking variables such
 ##      as the MicroInDel length or Compound_Handling, or when combining the results from multiple instances of ViReMa.
 ##      Consequently, the following code takes arguments from command line, and sends them to the config file for cross-module access.
 ##      Results Compilation is then initiated as normal.

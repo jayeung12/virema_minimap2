@@ -165,9 +165,7 @@ def build_minimap2_command(input_file, long_read_tech=None, is_initial=True):
         else:
             # -O 2,8 (long-gap open raised from the stock 4): a cheap long-gap cost let this
             # preset "limp through" a real second-locus fragment via many small indels instead
-            # of soft-clipping it for proper rescue, silently absorbing true junctions (verified
-            # directly on two misses: S1_53/combo-HiFi and S1_2/combo-HiFi -- raising O2 to 8
-            # recovered a clean second-locus split in both, confirmed against raw sequence).
+            # of soft-clipping it for proper rescue, silently absorbing true junctions.
             return [ALIGNER_DIRECTORY + 'minimap2', '-ax', 'sr', '-k', '10', '-w', '5', '-m', '10',
                     '-n', '2', '-A', '2', '-B', '2', '-O', '2,8', '-E', '2,1',
                     '--end-bonus', '5', '-s', '20', '-z', '200', '-r', '50',
@@ -442,10 +440,7 @@ def run_iterative_ont_alignment(long_read_tech='ont', max_rounds=LONG_READ_MAX_R
     `max_rounds` has run (round 1 is the initial alignment, so this allows max_rounds - 1 rescue
     rounds). Used for every technology: long_read_tech=None is short-read mode, which uses the
     short-read rescue preset and passes rewrite_insertions=False.
-
-    The long-read limit (6) is a safety bound -- successful rescues were observed to converge by
-    round 3-4, so it caps worst-case cost for reads that never resolve without affecting reads
-    that do."""
+    """
     round_num = 2
     current_temp_file = TEMP_READS_FILE
     temp_sam_file = TEMP_SAM_FILE
@@ -1005,10 +1000,7 @@ def _segment_strand(segment):
     would show a spurious strand mismatch between its primary segment and every rescued segment,
     incorrectly splitting them into separate paired records and/or flipping the Donor/Acceptor
     junction side used for position calculation, corrupting otherwise-ordinary non-inversion
-    events. (Confirmed empirically: an ordinary cisins read whose whole-read primary alignment
-    was minimap2 flag=16 had its Acceptor site jump from the correct position to a bogus one
-    ~3.3kb away -- exactly the primary segment's own reference span -- once naively given its own
-    absolute flag instead of being treated as the frame's forward anchor.)
+    events.
     """
     if segment.get('type') == 'main':
         return 0
@@ -1024,11 +1016,6 @@ def _absolute_strand(primary_read, frame_relative_strand):
     '_RevStrand' reference-name convention the bowtie path produces, and so what drives the strand
     columns of Read_Events.tsv, the Dir columns of the BEDPE, and the Copy/Snap-Back vs plain fusion
     distinction. Composing the frame-relative strand with the primary's own strand recovers it.
-
-    Leaving this out pinned every multi-segment record to forward: measured on
-    sr90_e0.25/fhv_600bp_fwd, 50 of 116 junction reads were reverse-strand in minimap2's own output
-    and none of them kept the bit, so minimap2 mode produced no '_RevStrand' libraries at all where
-    bowtie produced three.
 
     XOR, not OR, because a rescue segment's flag is relative to the primary's frame. For an
     inversion the two compose to opposite strands either way round -- a plus-strand read gives
@@ -1359,12 +1346,7 @@ def _give_back_insertion_bases(processed_groups, deficit):
     trailing soft clip into one -- and that clip is the very stretch the later rescue rounds
     realign -- so the primary goes on claiming bases that another group now also claims.
     Handing the excess back here moves no reported coordinate, because an insertion consumes no
-    reference, and it leaves every aligned block intact. The alternative, trimming the read's
-    outer edges, can wipe out a short group completely: on SRR34426337.67635 a 735-base
-    over-claim (a 1744nt read whose groups claimed 2479) fell on a 165-base group carrying a
-    481N junction and erased it, leaving a "1744H" record that crashed the compiler.
-
-    Returns whatever deficit could not be given back.
+    reference, and it leaves every aligned block intact.
     """
     candidates = []
     for group_idx, group in enumerate(processed_groups):
@@ -1495,8 +1477,7 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
             # rounds realign, into an insertion -- and shrinking one moves no coordinate and
             # re-frames nothing. Soft clips come second because giving back a LEADING one
             # shortens the claim without moving the record's SEQ window, which shifts the
-            # alignment against the read by what was taken: on SRR34426337.67635 that put the
-            # first 18M against the read's unaligned 118nt head.
+            # alignment against the read by what was taken.
             deficit = _give_back_insertion_bases(processed_groups, deficit)
             for group in reversed(processed_groups):
                 parts = group['cigar_parts']
@@ -1532,10 +1513,7 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
 
     # Nothing base-less may be emitted. A group can be left with no query-consuming operation
     # either by the accounting map, when every base it claimed had already gone to an earlier
-    # group, or by the reconciliation above. The record built from it is hard clips only, with
-    # an empty SEQ and QUAL -- not a valid SAM record, and it crashed
-    # RecreateOldFormatfromSAM()'s CIGAR walk, which assumes an operation follows a leading
-    # hard clip (SRR34426337.67635, one read of 116,303, emitted "1744H").
+    # group, or by the reconciliation above.
     processed_groups = [group for group in processed_groups
                         if _cigar_parts_query_length(group['cigar_parts'])]
     if not processed_groups:
@@ -1566,9 +1544,7 @@ def create_paired_records_new(base_read_name, primary_read, contiguous_groups, u
         # Where this group's record goes in the FILE. Groups are built in seq_pos order, i.e.
         # left-to-right along the primary's SEQ, but the old format and the bowtie path both list a
         # read's segments in READ (5'->3') order, and for a reverse-strand primary those are
-        # opposite. Emitting in frame order left a two-segment minus-strand read reporting the
-        # junction between the wrong ends of its two blocks: read loc1_S1_253 came out as
-        # FHV_RNA1:1535 -> FHV_RNA2:324 where bowtie gives FHV_RNA2:299 -> FHV_RNA1:1598.
+        # opposite.
         # Only the emission order is permuted -- every length, clip and position below stays in the
         # primary's frame, which is what the hard-clip arithmetic and update_hardclipped_values()
         # require.
@@ -2004,8 +1980,7 @@ def _locate_record(read_fields, read_sequence):
     that frame in the read's own orientation. A sequence that occurs more than once in one
     orientation, or not at all, gives up rather than guessing. One that occurs once in EACH
     orientation -- an inverted repeat, such as a short read across a perfect hairpin -- is placed
-    in the orientation the piece was made in (_EXPECTED_FLIP); without that, the first match won
-    and a hairpin's rescued arm landed inside the opposite arm.
+    in the orientation the piece was made in (_EXPECTED_FLIP).
     """
     sequence = read_fields[9]
     if not read_sequence or sequence in ('', '*'):
@@ -2110,10 +2085,7 @@ def _window_mismatch_rate(read_fields, read_sequence, window):
     This is the question a query-overlap tie-break actually needs to answer. Two alignments that
     overlap in query space both CLAIM the contested bases, but normally only one of them MATCHES
     there: the other has been extended past the junction into sequence belonging to the far side
-    and pays for it in mismatches. Comparing whole-alignment scores answers a different question
-    and is biased by length -- on read loc1_S1_3 of hifi/fhv_600bp_fwd a 645 nt block outscored a
-    299 nt one and so won 46 contested bases that matched the 299 nt block's reference exactly
-    (0/46) and its own with 26/46, moving the junction 46 nt off its true position.
+    and pays for it in mismatches.
     """
     located = _locate_record(read_fields, read_sequence)
     if located is None:
